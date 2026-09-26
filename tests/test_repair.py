@@ -210,6 +210,100 @@ def test_flip():
     assert g.np.isclose(m.volume, a.volume * 2.0)
 
 
+def test_nested_eccentric():
+    # a solid box with an eccentric spherical cavity where the
+    # cavity shell is incorrectly oriented as an independent solid
+    box = g.trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+    cavity = g.trimesh.creation.icosphere(radius=0.5)
+    cavity.apply_translation([0.4, 0.3, -0.2])
+
+    mesh = box + cavity
+    # both shells start out oriented as solids
+    assert g.np.isclose(mesh.volume, box.volume + cavity.volume)
+
+    # add per-face attributes to check they survive the fix
+    colors = g.np.arange(len(mesh.faces) * 4, dtype=g.np.uint8).reshape((-1, 4))
+    mesh.visual.face_colors = colors
+    vertices = mesh.vertices.copy()
+
+    g.trimesh.repair.fix_inversion(mesh, nested=True)
+
+    # signed volume and mass center should match a hollow box
+    expect_volume = box.volume - cavity.volume
+    assert g.np.isclose(mesh.volume, expect_volume)
+    expect_com = (
+        box.center_mass * box.volume - cavity.center_mass * cavity.volume
+    ) / expect_volume
+    assert g.np.allclose(mesh.center_mass, expect_com)
+
+    # vertex coordinates and face attributes should be untouched
+    assert g.np.allclose(mesh.vertices, vertices)
+    assert (mesh.visual.face_colors == colors).all()
+
+
+def test_nested_three_layers():
+    # a solid sphere inside a spherical cavity inside a solid
+    # box with all shell orientations scrambled
+    outer = g.trimesh.creation.box(extents=[4.0, 4.0, 4.0])
+    middle = g.trimesh.creation.icosphere(radius=1.2)
+    middle.apply_translation([0.4, -0.3, 0.2])
+    inner = g.trimesh.creation.icosphere(radius=0.5)
+    inner.apply_translation([0.7, -0.1, 0.4])
+
+    mesh = outer + middle + inner
+    # invert every shell so all orientations are wrong
+    mesh.invert()
+    assert mesh.volume < 0.0
+
+    mesh.fix_normals(nested=True)
+
+    # layers alternate solid, cavity, solid
+    expect_volume = outer.volume - middle.volume + inner.volume
+    assert g.np.isclose(mesh.volume, expect_volume)
+    expect_com = (
+        outer.center_mass * outer.volume
+        - middle.center_mass * middle.volume
+        + inner.center_mass * inner.volume
+    ) / expect_volume
+    assert g.np.allclose(mesh.center_mass, expect_com)
+    assert mesh.is_winding_consistent
+
+
+def test_nested_independent():
+    # disjoint solids should all be oriented outwards by nested
+    # mode exactly like the existing multibody mode
+    a = g.trimesh.creation.box()
+    b = g.trimesh.creation.box()
+    b.apply_translation([3.0, 0.0, 0.0])
+    b.invert()
+    mesh = a + b
+    g.trimesh.repair.fix_inversion(mesh, nested=True)
+    assert g.np.isclose(mesh.volume, 2.0)
+
+
+def test_nested_diagnostics():
+    # non-closed components should be diagnosed
+    broken = g.trimesh.creation.box() + g.trimesh.Trimesh(
+        vertices=[[0.0, 0.0, 5.0], [1.0, 0.0, 5.0], [0.0, 1.0, 5.0]],
+        faces=[[0, 1, 2]],
+    )
+    with g.pytest.raises(ValueError):
+        g.trimesh.repair.fix_inversion(broken, nested=True)
+
+    # intersecting shells should be diagnosed
+    a = g.trimesh.creation.box()
+    b = g.trimesh.creation.box()
+    b.apply_translation([0.7, 0.7, 0.3])
+    with g.pytest.raises(ValueError):
+        g.trimesh.repair.fix_inversion(a + b, nested=True)
+
+    # shells sharing boundary geometry should be diagnosed
+    inner = g.trimesh.creation.box(extents=[1.0, 0.5, 0.5])
+    outer = g.trimesh.creation.box()
+    with g.pytest.raises(ValueError):
+        g.trimesh.repair.fix_inversion(inner + outer, nested=True)
+
+
 def test_fan():
     # start by creating an icosphere and removing
     # all faces that include a single vertex to make

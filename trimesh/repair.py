@@ -8,10 +8,11 @@ Fill holes and fix winding and normals of meshes.
 import numpy as np
 
 from . import graph, triangles
-from .constants import log
+from .constants import log, tol
 from .geometry import faces_to_edges, triangulate_quads
 from .graph import connected_components
 from .grouping import group_rows, hashable_rows
+from .proximity import closest_point
 
 try:
     import networkx as nx
@@ -87,7 +88,96 @@ def fix_winding(mesh):
     log.debug("flipped %d/%d edges", flipped, len(mesh.faces) * 3)
 
 
-def fix_inversion(mesh, multibody: bool = False):
+def _nested_shell_flip(mesh, groups, face_edges, tri, cross):
+    """
+    Determine which faces to flip so that nested closed shells
+    alternate orientation by containment depth: the outermost
+    shells are solids with positive volume, shells directly
+    inside them are cavities with negative volume, shells inside
+    those are solids again, and so on.
+
+    Parameters
+    -------------
+    mesh : trimesh.Trimesh
+      Source mesh containing all shells.
+    groups : (n, ) sequence of (m, ) int
+      Face indexes of each connected component.
+    face_edges : (len(mesh.faces), 6) int
+      Edges of the source mesh indexable by face index.
+    tri : (len(mesh.faces), 3, 3) float
+      Triangles of the source mesh.
+    cross : (len(mesh.faces), 3) float
+      Cross products of the source mesh triangles.
+
+    Returns
+    -------------
+    flip : (len(mesh.faces), ) bool
+      Mask of faces which should be flipped.
+
+    Raises
+    ---------
+    ValueError
+      If any component is not a closed consistently wound
+      shell, or if any two shells touch or intersect.
+    """
+    # every component must be a closed consistently wound shell
+    bodies = []
+    for index, face_index in enumerate(groups):
+        is_tight, is_wound = graph.is_watertight(face_edges[face_index].reshape((-1, 2)))
+        if not (is_tight and is_wound):
+            raise ValueError(
+                f"nested=True requires every connected component to be a closed consistently wound shell: component {index} ({len(face_index)} faces) has watertight={is_tight} winding_consistent={is_wound}"
+            )
+        bodies.append(mesh.submesh([face_index], append=True))
+
+    # shells closer than this distance are considered to be touching
+    touch = tol.merge * mesh.scale
+
+    # count how many other shells contain each shell
+    depth = np.zeros(len(bodies), dtype=np.int64)
+    for index, body in enumerate(bodies):
+        for other_index, other in enumerate(bodies):
+            if index == other_index:
+                continue
+            # if the axis aligned bounding boxes are disjoint the
+            # shells can neither contain, touch, nor intersect
+            if (body.bounds[0] > other.bounds[1] + touch).any() or (
+                body.bounds[1] < other.bounds[0] - touch
+            ).any():
+                continue
+            # unsigned distance from this shell vertices to the other
+            # shell: vertices of a disjoint shell are strictly inside
+            # or strictly outside, never on the boundary
+            distance = closest_point(other, body.vertices)[1]
+            if distance.min() <= touch:
+                raise ValueError(
+                    f"nested=True requires geometrically disjoint shells: components {index} and {other_index} touch or share boundary geometry"
+                )
+            # ray-parity containment does not depend on face orientation
+            inside = other.contains(body.vertices)
+            if inside.all():
+                depth[index] += 1
+            elif inside.any():
+                raise ValueError(
+                    f"nested=True requires geometrically disjoint shells: components {index} and {other_index} intersect"
+                )
+
+    # mask of faces to flip
+    flip = np.zeros(len(mesh.faces), dtype=bool)
+    for face_index, shell_depth in zip(groups, depth):
+        # check the signed volume for just this shell
+        volume = triangles.mass_properties(
+            tri[face_index], crosses=cross[face_index], skip_inertia=True
+        ).volume
+        # solids (even depth) should have positive volume and
+        # cavities (odd depth) should have negative volume
+        if (shell_depth % 2 == 0) == (volume < 0.0):
+            flip[face_index] = True
+
+    return flip
+
+
+def fix_inversion(mesh, multibody: bool = False, nested: bool = False):
     """
     Check to see if a mesh has normals pointing "out."
 
@@ -97,21 +187,27 @@ def fix_inversion(mesh, multibody: bool = False):
       Mesh to fix in-place.
     multibody : bool
       If True will try to fix normals on every body
+      treating each connected component as an
+      independent solid.
+    nested : bool
+      If True treat connected components as nested closed
+      shells and alternate orientation by containment depth:
+      solid, cavity, solid inside a cavity, and so on.
+      Supersedes multibody and raises a ValueError if
+      components are not closed or touch or intersect.
     """
 
     # we are not considering multiple bodies so we only need to
     # do anything if the mesh is watertight and the volume is negative
-    if not multibody:
+    if not (multibody or nested):
         if mesh.is_watertight and mesh.volume < 0.0:
             # this will make things worse for non-watertight meshes
             mesh.invert()
         return
 
-    # get groups of connected faces
-    groups = connected_components(mesh.face_adjacency)
-
-    # mask of faces to flip
-    flip = np.zeros(len(mesh.faces), dtype=bool)
+    # get groups of connected faces making sure faces with no
+    # adjacency information are included as single-face groups
+    groups = connected_components(mesh.face_adjacency, nodes=np.arange(len(mesh.faces)))
 
     # save these to avoid thrashing cache in a loop
     tri = mesh.triangles
@@ -119,27 +215,36 @@ def fix_inversion(mesh, multibody: bool = False):
     # get the edges indexable as faces
     face_edges = mesh.edges.reshape((-1, 6))
 
-    # loop through indexes of `mesh.faces`
-    for face_index in groups:
-        # we need watertight bodies to do anything so immediately
-        # skip anything smaller than 4 faces (tetrahedron)
-        if len(face_index) < 4:
-            continue
-        # check the watertightness and winding of this group
-        is_tight, is_wound = graph.is_watertight(face_edges[face_index].reshape((-1, 2)))
+    if nested:
+        # alternate orientation by shell containment depth
+        flip = _nested_shell_flip(mesh, groups, face_edges, tri, cross)
+    else:
+        # mask of faces to flip
+        flip = np.zeros(len(mesh.faces), dtype=bool)
 
-        # if we're not completely correct skip it as flipping faces will make it worse
-        if not (is_tight and is_wound):
-            continue
+        # loop through indexes of `mesh.faces`
+        for face_index in groups:
+            # we need watertight bodies to do anything so immediately
+            # skip anything smaller than 4 faces (tetrahedron)
+            if len(face_index) < 4:
+                continue
+            # check the watertightness and winding of this group
+            is_tight, is_wound = graph.is_watertight(
+                face_edges[face_index].reshape((-1, 2))
+            )
 
-        # check the volume for just this body
-        volume = triangles.mass_properties(
-            tri[face_index], crosses=cross[face_index], skip_inertia=True
-        ).volume
-        # if that volume is negative it is either
-        # inverted or just total garbage
-        if volume < 0.0:
-            flip[face_index] = True
+            # if we're not completely correct skip it as flipping faces will make it worse
+            if not (is_tight and is_wound):
+                continue
+
+            # check the volume for just this body
+            volume = triangles.mass_properties(
+                tri[face_index], crosses=cross[face_index], skip_inertia=True
+            ).volume
+            # if that volume is negative it is either
+            # inverted or just total garbage
+            if volume < 0.0:
+                flip[face_index] = True
 
     # one or more faces needs flipping
     if flip.any():
@@ -156,7 +261,7 @@ def fix_inversion(mesh, multibody: bool = False):
             mesh.face_normals = normals
 
 
-def fix_normals(mesh, multibody=False):
+def fix_normals(mesh, multibody=False, nested=False):
     """
     Fix the winding and direction of a mesh face and
     face normals in-place.
@@ -172,6 +277,10 @@ def fix_normals(mesh, multibody=False):
     multibody : bool
       if True try to correct normals direction
       on every body rather than just one
+    nested : bool
+      If True treat connected components as nested
+      closed shells alternating between solid and
+      cavity orientation by containment depth
 
     Notes
     --------------
@@ -180,7 +289,7 @@ def fix_normals(mesh, multibody=False):
     # traverse face adjacency to correct winding
     fix_winding(mesh)
     # check to see if a mesh is inverted
-    fix_inversion(mesh, multibody=multibody)
+    fix_inversion(mesh, multibody=multibody, nested=nested)
 
 
 def broken_faces(mesh, color=None):
