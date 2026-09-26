@@ -8,10 +8,11 @@ Fill holes and fix winding and normals of meshes.
 import numpy as np
 
 from . import graph, triangles
-from .constants import log
+from .constants import log, tol
 from .geometry import faces_to_edges, triangulate_quads
 from .graph import connected_components
 from .grouping import group_rows, hashable_rows
+from .proximity import closest_point, closest_point_naive
 
 try:
     import networkx as nx
@@ -87,7 +88,7 @@ def fix_winding(mesh):
     log.debug("flipped %d/%d edges", flipped, len(mesh.faces) * 3)
 
 
-def fix_inversion(mesh, multibody: bool = False):
+def fix_inversion(mesh, multibody: bool | str = False):
     """
     Check to see if a mesh has normals pointing "out."
 
@@ -95,13 +96,25 @@ def fix_inversion(mesh, multibody: bool = False):
     -------------
     mesh : trimesh.Trimesh
       Mesh to fix in-place.
-    multibody : bool
-      If True will try to fix normals on every body
+    multibody : bool or str
+      If True will try to fix normals on every body treating
+      each closed connected component as an independent solid.
+      If "nested" closed components are treated as nested shells
+      and oriented by containment depth: outermost shells are
+      solid material, shells directly inside them are cavities,
+      shells inside those are solid again, and so on.
     """
+    if isinstance(multibody, str):
+        if multibody != "nested":
+            raise ValueError('multibody must be a bool or "nested"')
+        nested = True
+    else:
+        nested = False
+        multibody = bool(multibody)
 
     # we are not considering multiple bodies so we only need to
     # do anything if the mesh is watertight and the volume is negative
-    if not multibody:
+    if not multibody and not nested:
         if mesh.is_watertight and mesh.volume < 0.0:
             # this will make things worse for non-watertight meshes
             mesh.invert()
@@ -119,27 +132,55 @@ def fix_inversion(mesh, multibody: bool = False):
     # get the edges indexable as faces
     face_edges = mesh.edges.reshape((-1, 6))
 
+    # closed components collected as (face_index, signed volume)
+    # only used in "nested" mode
+    closed = []
+
     # loop through indexes of `mesh.faces`
     for face_index in groups:
         # we need watertight bodies to do anything so immediately
         # skip anything smaller than 4 faces (tetrahedron)
         if len(face_index) < 4:
+            if nested:
+                raise ValueError(
+                    f"connected component with {len(face_index)} faces is not "
+                    "closed: nested shell mode requires every component to "
+                    "be a closed shell"
+                )
             continue
         # check the watertightness and winding of this group
         is_tight, is_wound = graph.is_watertight(face_edges[face_index].reshape((-1, 2)))
 
         # if we're not completely correct skip it as flipping faces will make it worse
         if not (is_tight and is_wound):
+            if nested:
+                raise ValueError(
+                    f"connected component with {len(face_index)} faces is not "
+                    "a closed consistently wound shell "
+                    f"(watertight={is_tight}, winding_consistent={is_wound})"
+                )
             continue
 
         # check the volume for just this body
         volume = triangles.mass_properties(
             tri[face_index], crosses=cross[face_index], skip_inertia=True
         ).volume
-        # if that volume is negative it is either
-        # inverted or just total garbage
-        if volume < 0.0:
+
+        if nested:
+            closed.append((face_index, volume))
+        elif volume < 0.0:
+            # if that volume is negative it is either
+            # inverted or just total garbage
             flip[face_index] = True
+
+    if nested:
+        # orient shells by containment depth: even depth is solid
+        # material with outward normals and odd depth is a cavity
+        depths = _shell_depths(mesh, [c[0] for c in closed])
+        for (face_index, volume), depth in zip(closed, depths):
+            # a degenerate zero-volume shell can't be oriented
+            if volume != 0.0 and (volume < 0.0) == (depth % 2 == 0):
+                flip[face_index] = True
 
     # one or more faces needs flipping
     if flip.any():
@@ -156,6 +197,133 @@ def fix_inversion(mesh, multibody: bool = False):
             mesh.face_normals = normals
 
 
+def _shell_samples(shell, count: int = 200) -> np.ndarray:
+    """
+    Get points on the surface of a shell to use for containment
+    and proximity queries.
+
+    Parameters
+    -------------
+    shell : trimesh.Trimesh
+      A single closed connected component.
+    count : int
+      Maximum number of points to return.
+
+    Returns
+    -------------
+    points : (n, 3) float
+      Vertices and triangle centers of the shell.
+    """
+    points = np.vstack((shell.vertices, shell.triangles_center))
+    if len(points) > count:
+        # subsample evenly and deterministically
+        points = points[np.linspace(0, len(points) - 1, count).astype(np.int64)]
+    return points
+
+
+def _surface_distance(shell, points: np.ndarray) -> np.ndarray:
+    """
+    Distance from each point to the closest point on a shell,
+    using the scipy accelerated query when it is available.
+    """
+    try:
+        return closest_point(shell, points)[1]
+    except ImportError:
+        # scipy isn't installed so use the slow pure-numpy path
+        return closest_point_naive(shell, points)[1]
+
+
+def _shell_depths(mesh, groups) -> np.ndarray:
+    """
+    Compute the nesting depth of every closed connected component
+    of a mesh: how many other closed shells contain it.
+
+    Parameters
+    -------------
+    mesh : trimesh.Trimesh
+      Source geometry.
+    groups : (n, ) (m, ) int
+      Face indexes of closed connected components.
+
+    Returns
+    -------------
+    depth : (n, ) int
+      Number of other shells containing each component.
+    """
+    # imported here to avoid a circular import as base imports repair
+    from .base import Trimesh
+
+    # construct one mesh per shell re-indexed to only the
+    # vertices referenced by that component so bounds are local
+    shells = []
+    for face_index in groups:
+        faces = mesh.faces[face_index]
+        unique, inverse = np.unique(faces, return_inverse=True)
+        shells.append(
+            Trimesh(
+                vertices=mesh.vertices[unique],
+                faces=inverse.reshape((-1, 3)),
+                process=False,
+            )
+        )
+
+    # samples closer than this to another shell are considered
+    # to be touching it making containment ambiguous
+    touch = tol.merge * mesh.scale
+
+    depth = np.zeros(len(shells), dtype=np.int64)
+
+    for a in range(len(shells)):
+        for b in range(a + 1, len(shells)):
+            # if the axis aligned bounding boxes don't overlap the
+            # shells can neither contain nor touch each other
+            bounds_a, bounds_b = shells[a].bounds, shells[b].bounds
+            if (bounds_a[1] < bounds_b[0] - touch).any() or (
+                bounds_b[1] < bounds_a[0] - touch
+            ).any():
+                continue
+
+            # check many surface points rather than a single vertex
+            # which might lie exactly on the other shell
+            points_a = _shell_samples(shells[a])
+            points_b = _shell_samples(shells[b])
+
+            # shells which touch or interpenetrate have no
+            # well defined containment relationship
+            if (
+                _surface_distance(shells[b], points_a).min() < touch
+                or _surface_distance(shells[a], points_b).min() < touch
+            ):
+                raise ValueError(
+                    f"shells {a} and {b} touch: containment is ambiguous "
+                    "for shells which are not fully disjoint"
+                )
+
+            # ray-parity containment of every sample point
+            a_in_b = shells[b].contains(points_a)
+            b_in_a = shells[a].contains(points_b)
+
+            if (a_in_b.any() and not a_in_b.all()) or (
+                b_in_a.any() and not b_in_a.all()
+            ):
+                raise ValueError(
+                    f"shells {a} and {b} intersect: containment is "
+                    "ambiguous for shells which pass through each other"
+                )
+            if a_in_b.all() and b_in_a.all():
+                raise ValueError(
+                    f"shells {a} and {b} contain each other: "
+                    "geometry is not orientable as nested shells"
+                )
+
+            if a_in_b.all():
+                depth[a] += 1
+            elif b_in_a.all():
+                depth[b] += 1
+
+    return depth
+
+
 def fix_normals(mesh, multibody=False):
     """
     Fix the winding and direction of a mesh face and
@@ -169,9 +337,12 @@ def fix_normals(mesh, multibody=False):
     -------------
     mesh : trimesh.Trimesh
       Mesh to fix normals on
-    multibody : bool
-      if True try to correct normals direction
-      on every body rather than just one
+    multibody : bool or str
+      If True try to correct normals direction on every body
+      rather than just one, treating each closed component as
+      an independent solid. If "nested" orient closed components
+      as nested shells alternating between solid and cavity by
+      containment depth.
 
     Notes
     --------------

@@ -197,6 +197,113 @@ def test_multi():
     assert g.np.isclose(m.volume, 2.0)
 
 
+def test_nested_inversion():
+    """
+    Nested shell mode should orient closed components by containment
+    depth alternating between solid and cavity.
+    """
+    # outer solid box centered on [2, 2, 2]
+    outer = g.trimesh.creation.box(extents=[4.0, 4.0, 4.0])
+    outer.apply_translation([2.0, 2.0, 2.0])
+    # eccentric cavity box centered on [1, 2, 2]
+    cavity = g.trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+    cavity.apply_translation([1.0, 2.0, 2.0])
+
+    mesh = outer + cavity
+    # tag faces with an attribute to check it survives the repair
+    colors = (g.np.arange(len(mesh.faces) * 4).reshape((-1, 4)) % 255).astype(
+        g.np.uint8
+    )
+    mesh.visual.face_colors = colors
+    verts = mesh.vertices.copy()
+
+    # the cavity is oriented like a solid which is what
+    # multibody=True produces: the sum of both volumes
+    assert g.np.isclose(mesh.volume, 65.0)
+
+    g.trimesh.repair.fix_inversion(mesh, multibody="nested")
+
+    # volume should now be the hollow part: outer minus cavity
+    assert g.np.isclose(mesh.volume, 64.0 - 1.0)
+    # mass center should be shifted away from the eccentric cavity
+    expected = (64.0 * g.np.array([2.0, 2.0, 2.0]) - g.np.array([1.0, 2.0, 2.0])) / 63.0
+    assert g.np.allclose(mesh.center_mass, expected)
+    # vertices and face attributes should be untouched
+    assert g.np.allclose(mesh.vertices, verts)
+    assert (mesh.visual.face_colors == colors).all()
+
+    # running the repair again should be a no-op
+    g.trimesh.repair.fix_inversion(mesh, multibody="nested")
+    assert g.np.isclose(mesh.volume, 63.0)
+
+    # the pre-existing multibody mode still treats every
+    # shell as an independent solid
+    mesh = outer + cavity
+    g.trimesh.repair.fix_inversion(mesh, multibody=True)
+    assert g.np.isclose(mesh.volume, 65.0)
+
+
+def test_nested_inversion_layers():
+    """
+    A solid inside a cavity inside a solid should alternate
+    orientation at every level of nesting.
+    """
+    outer = g.trimesh.creation.box(extents=[4.0, 4.0, 4.0])
+    outer.apply_translation([2.0, 2.0, 2.0])
+    cavity = g.trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+    cavity.apply_translation([2.0, 2.0, 2.0])
+    # eccentric solid inside the cavity
+    inner = g.trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+    inner.apply_translation([1.6, 2.0, 2.0])
+
+    mesh = outer + cavity + inner
+    # invert every shell so the repair has to flip all of them
+    mesh.invert()
+    assert g.np.isclose(mesh.volume, -(64.0 + 8.0 + 1.0))
+
+    mesh.fix_normals(multibody="nested")
+
+    assert g.np.isclose(mesh.volume, 64.0 - 8.0 + 1.0)
+    expected = (
+        64.0 * g.np.array([2.0, 2.0, 2.0])
+        - 8.0 * g.np.array([2.0, 2.0, 2.0])
+        + g.np.array([1.6, 2.0, 2.0])
+    ) / 57.0
+    assert g.np.allclose(mesh.center_mass, expected)
+
+
+def test_nested_inversion_invalid():
+    """
+    Nested shell mode should diagnose geometry with no
+    well defined containment relationship.
+    """
+    outer = g.trimesh.creation.box(extents=[4.0, 4.0, 4.0])
+    outer.apply_translation([2.0, 2.0, 2.0])
+
+    # a shell touching the outer shell is ambiguous
+    touch = g.trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+    touch.apply_translation([3.5, 3.5, 3.5])
+    with g.pytest.raises(ValueError, match="touch"):
+        g.trimesh.repair.fix_inversion(outer + touch, multibody="nested")
+
+    # a shell passing through the outer shell is ambiguous
+    inter = g.trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+    inter.apply_translation([3.5, 2.0, 2.0])
+    with g.pytest.raises(ValueError, match="intersect"):
+        g.trimesh.repair.fix_inversion(outer + inter, multibody="nested")
+
+    # a component which isn't closed can't be a shell
+    broken = g.trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+    broken.apply_translation([1.0, 2.0, 2.0])
+    broken.update_faces(g.np.arange(len(broken.faces)) != 0)
+    with g.pytest.raises(ValueError, match="closed"):
+        g.trimesh.repair.fix_inversion(outer + broken, multibody="nested")
+
+    # anything other than a bool or "nested" is rejected
+    with g.pytest.raises(ValueError):
+        g.trimesh.repair.fix_inversion(outer + outer.copy(), multibody="nesting")
+
+
 def test_flip():
     # create two spheres
     a = g.trimesh.creation.icosphere()

@@ -1949,7 +1949,7 @@ class Trimesh(Geometry3D):
 
         return on_hull
 
-    def fix_normals(self, multibody: bool | None = None) -> Self:
+    def fix_normals(self, multibody: bool | str | None = None) -> Self:
         """
         Find and fix problems with self.face_normals and self.faces
         winding direction.
@@ -1960,9 +1960,11 @@ class Trimesh(Geometry3D):
 
         Parameters
         -------------
-        multibody : None or bool
+        multibody : None, bool, or str
           Fix normals across multiple bodies or if unspecified
-          check the current `Trimesh.body_count`.
+          check the current `Trimesh.body_count`. If "nested"
+          orient closed components as nested shells alternating
+          between solid and cavity by containment depth.
         """
         if multibody is None:
             multibody = self.body_count > 1
