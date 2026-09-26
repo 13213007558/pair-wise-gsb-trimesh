@@ -526,6 +526,164 @@ def test_mass_against_solidworks():
                 assert g.np.allclose(calc[key], truth[key], atol=1e-2)
 
 
+def _surface_origin_inertia(inertia, mass, center_mass, origin):
+    offset = center_mass - origin
+    return inertia + mass * (
+        g.np.dot(offset, offset) * g.np.eye(3) - g.np.outer(offset, offset)
+    )
+
+
+def _surface_center_inertia(inertia, mass, center_mass):
+    return inertia - mass * (
+        g.np.dot(center_mass, center_mass) * g.np.eye(3)
+        - g.np.outer(center_mass, center_mass)
+    )
+
+
+def test_surface_mass_properties_triangle():
+    vertices = g.np.array(
+        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]]
+    )
+    faces = g.np.array([[0, 1, 2]])
+    mesh = g.trimesh.Trimesh(vertices, faces, process=False)
+
+    vertex_density = g.np.array([2.0, 5.0, 7.0])
+    props = mesh.surface_mass_properties(vertex_density=vertex_density)
+
+    assert g.np.isclose(props.mass, 28.0)
+    assert g.np.allclose(props.center_mass, [19.0 / 14.0, 9.0 / 8.0, 0.0])
+    assert g.np.allclose(
+        props.inertia,
+        [
+            [252.0 / 5.0, -156.0 / 5.0, 0.0],
+            [-156.0 / 5.0, 384.0 / 5.0, 0.0],
+            [0.0, 0.0, 636.0 / 5.0],
+        ],
+    )
+
+    reference = g.np.array([1.5, -2.0, 4.0])
+    referenced = mesh.surface_mass_properties(
+        vertex_density=vertex_density, origin=reference
+    )
+    center_inertia = _surface_center_inertia(
+        props.inertia, props.mass, props.center_mass
+    )
+    expected = _surface_origin_inertia(
+        center_inertia, props.mass, props.center_mass, reference
+    )
+    assert g.np.allclose(referenced.inertia, expected)
+    assert g.np.allclose(referenced.origin, reference)
+
+
+def test_surface_mass_properties_two_density_plate():
+    vertices = g.np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+    faces = g.np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]])
+    mesh = g.trimesh.Trimesh(vertices, faces, process=False)
+
+    face_density = g.np.array([2.0, 2.0, 5.0, 5.0])
+    props = mesh.surface_mass_properties(face_density=face_density)
+
+    assert g.np.isclose(props.mass, 7.0)
+    assert g.np.allclose(props.center_mass, [17.0 / 14.0, 0.5, 0.0])
+    assert g.np.allclose(
+        props.inertia,
+        [
+            [7.0 / 3.0, -17.0 / 4.0, 0.0],
+            [-17.0 / 4.0, 37.0 / 3.0, 0.0],
+            [0.0, 0.0, 44.0 / 3.0],
+        ],
+    )
+
+    vertex_density = g.np.array([2.0] * 4 + [5.0] * 4)
+    shared = mesh.surface_mass_properties(vertex_density=vertex_density)
+    assert g.np.isclose(shared.mass, props.mass)
+    assert g.np.allclose(shared.center_mass, props.center_mass)
+    assert g.np.allclose(shared.inertia, props.inertia)
+
+    scalar = mesh.surface_mass_properties(face_density=2.0)
+    assert g.np.isclose(scalar.mass, 4.0)
+    assert g.np.allclose(scalar.center_mass, [1.0, 0.5, 0.0])
+
+
+def test_surface_mass_properties_transforms():
+    vertices = g.np.array(
+        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]]
+    )
+    faces = g.np.array([[0, 1, 2]])
+    density = g.np.array([2.0, 5.0, 7.0])
+    mesh = g.trimesh.Trimesh(vertices, faces, process=False)
+    original = mesh.surface_mass_properties(vertex_density=density)
+
+    translation = g.np.array([3.0, -4.0, 6.0])
+    translated = mesh.copy().apply_translation(translation)
+    moved = translated.surface_mass_properties(vertex_density=density)
+    center_inertia = _surface_center_inertia(
+        original.inertia, original.mass, original.center_mass
+    )
+    assert g.np.isclose(moved.mass, original.mass)
+    assert g.np.allclose(moved.center_mass, original.center_mass + translation)
+    assert g.np.allclose(
+        moved.inertia,
+        _surface_origin_inertia(
+            center_inertia,
+            original.mass,
+            original.center_mass + translation,
+            g.np.zeros(3),
+        ),
+    )
+
+    angle = 0.7
+    rotation = g.trimesh.transformations.rotation_matrix(
+        angle, [0.0, 0.0, 1.0]
+    )
+    rotated = mesh.copy().apply_transform(rotation)
+    turned = rotated.surface_mass_properties(vertex_density=density)
+    rot3 = rotation[:3, :3]
+    assert g.np.isclose(turned.mass, original.mass)
+    assert g.np.allclose(turned.center_mass, rot3 @ original.center_mass)
+    assert g.np.allclose(turned.inertia, rot3 @ original.inertia @ rot3.T)
+
+    scale = 2.5
+    scaled = mesh.copy().apply_scale(scale)
+    grown = scaled.surface_mass_properties(vertex_density=density)
+    assert g.np.isclose(grown.mass, scale**2 * original.mass)
+    assert g.np.allclose(grown.center_mass, scale * original.center_mass)
+    assert g.np.allclose(grown.inertia, scale**4 * original.inertia)
+
+
+def test_surface_mass_properties_validation():
+    vertices = g.np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+    )
+    faces = g.np.array([[0, 1, 2]])
+    mesh = g.trimesh.Trimesh(vertices, faces, process=False)
+    props = mesh.surface_mass_properties(vertex_density=[1.0, 2.0, 3.0])
+    assert props.mass == 0.0
+    assert g.np.allclose(props.inertia, g.np.zeros((3, 3)))
+
+    with g.pytest.raises(ValueError, match="non-negative"):
+        mesh.surface_mass_properties(vertex_density=[1.0, -2.0, 3.0])
+    with g.pytest.raises(ValueError, match="correspond to each vertex"):
+        mesh.surface_mass_properties(vertex_density=[1.0, 2.0])
+    with g.pytest.raises(ValueError, match="correspond to each face"):
+        mesh.surface_mass_properties(face_density=[1.0, 2.0])
+    with g.pytest.raises(ValueError, match="not both"):
+        mesh.surface_mass_properties(
+            vertex_density=[1.0, 1.0, 1.0], face_density=[1.0]
+        )
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     test_mass_against_solidworks()

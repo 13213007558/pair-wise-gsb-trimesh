@@ -44,7 +44,7 @@ from .exceptions import ExceptionWrapper
 from .exchange.export import export_mesh
 from .parent import Geometry3D
 from .scene import Scene
-from .triangles import MassProperties
+from .triangles import MassProperties, SurfaceMassProperties
 from .typed import (
     ArrayLike,
     BooleanEngineType,
@@ -773,6 +773,68 @@ class Trimesh(Geometry3D):
             transform=np.dot(offset, transform),
             mass=props["mass"],
             parallel_axis=True,
+        )
+
+    def surface_mass_properties(
+        self,
+        vertex_density: ArrayLike | Number | None = None,
+        face_density: ArrayLike | Number | None = None,
+        origin: ArrayLike | None = None,
+    ) -> SurfaceMassProperties:
+        """
+        Calculate mass properties of the mesh as a thin surface.
+
+        Unlike :py:meth:`Trimesh.mass_properties`, this does not use a
+        closed-volume integral and remains valid for open triangle soups.
+        Vertex densities are linearly interpolated across each triangle,
+        while face densities are constant on each triangle.
+
+        Parameters
+        ------------
+        vertex_density : (len(self.vertices),) float or number
+          Areal density at every vertex.
+        face_density : (len(self.faces),) float or number
+          Constant areal density on every face.
+        origin : (3,) float
+          Reference point for the inertia tensor. Defaults to the origin.
+
+        Returns
+        ------------
+        properties : SurfaceMassProperties
+          Total surface mass, center of mass, and inertia at `origin`.
+        """
+        if vertex_density is not None:
+            vertex_density = np.asanyarray(vertex_density, dtype=np.float64)
+            if vertex_density.ndim == 0:
+                vertex_density = np.full(
+                    len(self.vertices), float(vertex_density), dtype=np.float64
+                )
+            elif vertex_density.shape != (len(self.vertices),):
+                raise ValueError(f"vertex_density must correspond to each vertex! {vertex_density.shape} != ({len(self.vertices)},)")
+            if not np.isfinite(vertex_density).all() or (
+                vertex_density < 0.0
+            ).any():
+                raise ValueError("densities must be finite and non-negative!")
+            corner_density = vertex_density[self.faces]
+        else:
+            corner_density = None
+
+        if face_density is not None:
+            face_density = np.asanyarray(face_density, dtype=np.float64)
+            if face_density.ndim == 0:
+                face_density = np.full(
+                    len(self.faces), float(face_density), dtype=np.float64
+                )
+            elif face_density.shape != (len(self.faces),):
+                raise ValueError(f"face_density must correspond to each face! {face_density.shape} != ({len(self.faces)},)")
+            if not np.isfinite(face_density).all() or (face_density < 0.0).any():
+                raise ValueError("densities must be finite and non-negative!")
+
+        return triangles.surface_mass_properties(
+            self.triangles,
+            vertex_density=corner_density,
+            face_density=face_density,
+            origin=origin,
         )
 
     @cache_decorator

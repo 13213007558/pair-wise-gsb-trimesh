@@ -13,7 +13,7 @@ import numpy as np
 from . import util
 from .constants import tol
 from .points import point_plane_distance
-from .typed import NDArray, float64
+from .typed import ArrayLike, NDArray, float64
 from .util import diagonal_dot, unitize
 
 log = getLogger(__name__)
@@ -212,6 +212,190 @@ class MassProperties:
     def __getitem__(self, item: str):
         # add for backwards compatibility
         return getattr(self, item)
+
+
+@dataclass
+class SurfaceMassProperties:
+    # total surface mass
+    mass: float
+
+    # the (3,) center of mass in world coordinates
+    center_mass: NDArray[float64]
+
+    # the (3, 3) inertia tensor at the requested reference point
+    inertia: NDArray[float64]
+
+    # the (3,) reference point used for the inertia tensor
+    origin: NDArray[float64]
+
+    def __getitem__(self, item: str):
+        # add for backwards compatibility
+        return getattr(self, item)
+
+
+def _check_surface_density(
+    density: ArrayLike | None, count: int, vertex: bool
+) -> NDArray[float64] | None:
+    if density is None:
+        return None
+    density = np.asanyarray(density, dtype=np.float64)
+    if density.ndim == 0:
+        value = float(density)
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("densities must be finite and non-negative!")
+        shape = (count, 3) if vertex else (count,)
+        return np.full(shape, value, dtype=np.float64)
+
+    shape = (count, 3) if vertex else (count,)
+    if density.shape != shape:
+        kind = "vertex" if vertex else "face"
+        raise ValueError(
+            f"{kind} density must have shape {shape}, got {density.shape}!"
+        )
+    if not np.isfinite(density).all() or (density < 0.0).any():
+        raise ValueError("densities must be finite and non-negative!")
+    return density
+
+
+def surface_mass_properties(
+    triangles,
+    vertex_density=None,
+    face_density=None,
+    origin=None,
+) -> SurfaceMassProperties:
+    """
+    Calculate mass properties of triangular surface patches.
+
+    Vertex densities are linearly interpolated inside each triangle.
+    Face densities are constant on each triangle. Degenerate triangles
+    contribute no mass. The mesh does not need to be closed.
+
+    Parameters
+    ----------
+    triangles : (n, 3, 3) float
+      Triangle vertices in space.
+    vertex_density : (n, 3) float or number, optional
+      Areal density at the three corners of every triangle.
+    face_density : (n,) float or number, optional
+      Constant areal density of every triangle.
+    origin : (3,) float, optional
+      Reference point for the returned inertia tensor. Defaults to zero.
+
+    Returns
+    ---------
+    properties : SurfaceMassProperties
+      Surface mass, center of mass, and inertia tensor.
+    """
+    triangles = np.asanyarray(triangles, dtype=np.float64)
+    if not util.is_shape(triangles, (-1, 3, 3), allow_zeros=True):
+        raise ValueError("Triangles must be (n, 3, 3)!")
+    if vertex_density is not None and face_density is not None:
+        raise ValueError("Specify either vertex density or face density, not both!")
+
+    count = len(triangles)
+    vertex_density = _check_surface_density(vertex_density, count, vertex=True)
+    face_density = _check_surface_density(face_density, count, vertex=False)
+
+    if vertex_density is None:
+        if face_density is None:
+            corner_density = np.ones((count, 3), dtype=np.float64)
+        else:
+            corner_density = np.repeat(face_density[:, None], 3, axis=1)
+    else:
+        corner_density = vertex_density
+
+    if origin is None:
+        origin = np.zeros(3, dtype=np.float64)
+    else:
+        origin = np.asanyarray(origin, dtype=np.float64)
+        if origin.shape != (3,):
+            raise ValueError(f"origin must have shape (3,), got {origin.shape}!")
+        if not np.isfinite(origin).all():
+            raise ValueError("origin must be finite!")
+
+    crosses = cross(triangles)
+    areas = area(crosses=crosses)
+    valid = areas > 0.0
+
+    relative = triangles - origin
+    vertex_sum = corner_density.sum(axis=1)[:, None]
+    position_sum = relative.sum(axis=1)
+    weighted_position = (corner_density[:, :, None] * relative[:, :, :]).sum(axis=1)
+
+    mass_faces = areas * corner_density.sum(axis=1) / 3.0
+    first_moment_faces = (
+        areas[:, None]
+        / 12.0
+        * (vertex_sum * position_sum + weighted_position)
+    )
+
+    square = relative**2
+    weighted_square = (corner_density[:, :, None] * square).sum(axis=1)
+    second_diagonal = (
+        areas[:, None]
+        / 60.0
+        * (
+            vertex_sum * (position_sum**2 + square.sum(axis=1))
+            + 2.0 * weighted_position * position_sum
+            + 2.0 * weighted_square
+        )
+    )
+
+    pair_i = np.array([0, 0, 1], dtype=np.int64)
+    pair_j = np.array([1, 2, 2], dtype=np.int64)
+    coordinate_i = relative[:, :, pair_i]
+    coordinate_j = relative[:, :, pair_j]
+    pair_dot = (coordinate_i * coordinate_j).sum(axis=1)
+    weighted_pair_dot = (corner_density[:, :, None] * coordinate_i * coordinate_j).sum(
+        axis=1
+    )
+    second_off_diagonal = (
+        areas[:, None]
+        / 60.0
+        * (
+            vertex_sum
+            * (
+                position_sum[:, pair_i] * position_sum[:, pair_j]
+                + pair_dot
+            )
+            + weighted_position[:, pair_i] * position_sum[:, pair_j]
+            + position_sum[:, pair_i] * weighted_position[:, pair_j]
+            + 2.0 * weighted_pair_dot
+        )
+    )
+
+    mass_faces[~valid] = 0.0
+    first_moment_faces[~valid] = 0.0
+    second_diagonal[~valid] = 0.0
+    second_off_diagonal[~valid] = 0.0
+
+    mass = float(mass_faces.sum())
+    if mass <= 0.0:
+        return SurfaceMassProperties(
+            mass=0.0,
+            center_mass=origin.copy(),
+            inertia=np.zeros((3, 3), dtype=np.float64),
+            origin=origin.copy(),
+        )
+
+    center_mass = origin + first_moment_faces.sum(axis=0) / mass
+    diagonal = second_diagonal.sum(axis=0)
+    off_diagonal = second_off_diagonal.sum(axis=0)
+    inertia = np.array(
+        [
+            [diagonal[1] + diagonal[2], -off_diagonal[0], -off_diagonal[1]],
+            [-off_diagonal[0], diagonal[0] + diagonal[2], -off_diagonal[2]],
+            [-off_diagonal[1], -off_diagonal[2], diagonal[0] + diagonal[1]],
+        ],
+        dtype=np.float64,
+    )
+
+    return SurfaceMassProperties(
+        mass=mass,
+        center_mass=center_mass,
+        inertia=inertia,
+        origin=origin.copy(),
+    )
 
 
 def mass_properties(
