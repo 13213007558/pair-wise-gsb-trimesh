@@ -332,6 +332,127 @@ def mass_properties(
     return result
 
 
+@dataclass
+class SurfaceMassProperties:
+    # the total mass of the surface
+    mass: float
+
+    # the (3,) center of mass
+    center_mass: NDArray[float64]
+
+    # the (3, 3) inertia tensor about the requested reference point
+    inertia: NDArray[float64]
+
+    def __getitem__(self, item: str):
+        # add for backwards compatibility
+        return getattr(self, item)
+
+
+def surface_mass_properties(
+    triangles, density, reference_point=None
+) -> SurfaceMassProperties:
+    """
+    Calculate the mass properties of a thin-walled surface where
+    mass is distributed over the area of the triangles rather than
+    an enclosed volume.
+
+    Density is specified per triangle corner as a mass-per-area value
+    and is linearly interpolated across each triangle. The result
+    does not require the triangles to enclose a volume.
+
+    Parameters
+    ----------
+    triangles : (n, 3, 3) float
+      Triangle vertices in space.
+    density : (n, 3) float
+      Non-negative area density at each corner of every triangle,
+      linearly interpolated within the triangle.
+    reference_point : None or (3,) float
+      Point about which the inertia tensor is calculated.
+      If None the tensor is calculated about the center of mass.
+
+    Returns
+    ---------
+    info : SurfaceMassProperties
+      Mass properties of the surface.
+    """
+    triangles = np.asanyarray(triangles, dtype=np.float64)
+    if not util.is_shape(triangles, (-1, 3, 3)):
+        raise ValueError("Triangles must be (n, 3, 3)!")
+
+    density = np.asanyarray(density, dtype=np.float64)
+    if density.shape != (len(triangles), 3):
+        raise ValueError(
+            f"Density must be per-corner (n, 3) got {density.shape} for {len(triangles)} triangles!"
+        )
+    if (density < 0.0).any():
+        raise ValueError("Density values must be non-negative!")
+
+    # area of each triangle, always positive for a surface
+    # degenerate triangles have zero area and contribute no mass
+    areas = area(crosses=cross(triangles))
+
+    # integrals of barycentric coordinate products over a triangle
+    # int(lambda_i) = A / 3
+    # int(lambda_i * lambda_j) = A * (1 + (i == j)) / 12
+    # int(lambda_i * lambda_j * lambda_k) = A * (i! j! k!) / 120
+    density_sum = density.sum(axis=1)
+
+    # mass of each triangle
+    mass_tri = areas * density_sum / 3.0
+
+    # first moment int(x * density) of each triangle
+    moment = (areas / 12.0)[:, None] * (
+        np.einsum("ni,nij->nj", density, triangles)
+        + density_sum[:, None] * triangles.sum(axis=1)
+    )
+
+    # weight of each (i, j, k) corner combination in int(lambda_i*lambda_j*lambda_k)
+    i, j, k = np.indices((3, 3, 3))
+    equal = (i == j).astype(np.int64) + (j == k).astype(np.int64) + (i == k)
+    weights = np.where(
+        equal == 3, 1.0 / 10.0, np.where(equal > 0, 1.0 / 30.0, 1.0 / 60.0)
+    )
+
+    # second moment int(x * x^T * density) of each triangle
+    # factorized as V^T @ (D . density) @ V per triangle
+    factor = np.einsum("ijk,nk->nij", weights, density) * areas[:, None, None]
+    second = np.einsum("nia,nij,njb->nab", triangles, factor, triangles)
+
+    mass = mass_tri.sum()
+    moment = moment.sum(axis=0)
+    second = second.sum(axis=0)
+
+    if mass > tol.zero:
+        center_mass = moment / mass
+    else:
+        # no mass anywhere: fall back to the geometric centroid
+        center_mass = triangles.mean(axis=(0, 1))
+
+    if reference_point is None:
+        reference_point = center_mass
+    reference_point = np.asanyarray(reference_point, dtype=np.float64)
+    if reference_point.shape != (3,):
+        raise ValueError("reference_point must be (3,)!")
+
+    # inertia about the reference point from the parallel axis expansion
+    # int(|x - p|^2 I - (x - p)(x - p)^T) density dx
+    trace = (
+        np.trace(second)
+        - 2.0 * np.dot(reference_point, moment)
+        + mass * np.dot(reference_point, reference_point)
+    )
+    inertia = (
+        trace * np.eye(3)
+        - second
+        + np.outer(moment, reference_point)
+        + np.outer(reference_point, moment)
+        - mass * np.outer(reference_point, reference_point)
+    )
+
+    return SurfaceMassProperties(mass=mass, center_mass=center_mass, inertia=inertia)
+
+
 def windings_aligned(triangles, normals_compare):
     """
     Given a list of triangles and a list of normals determine if the

@@ -44,7 +44,7 @@ from .exceptions import ExceptionWrapper
 from .exchange.export import export_mesh
 from .parent import Geometry3D
 from .scene import Scene
-from .triangles import MassProperties
+from .triangles import MassProperties, SurfaceMassProperties
 from .typed import (
     ArrayLike,
     BooleanEngineType,
@@ -2863,6 +2863,75 @@ class Trimesh(Geometry3D):
             density=density,
             center_mass=center_mass,
             skip_inertia=False,
+        )
+
+    def surface_mass_properties(
+        self,
+        vertex_density: ArrayLike | Number | None = None,
+        face_density: ArrayLike | Number | None = None,
+        reference_point: ArrayLike | None = None,
+    ) -> SurfaceMassProperties:
+        """
+        Returns the mass properties of the mesh treated as a thin-walled
+        surface where mass is distributed over the surface area rather
+        than an enclosed volume, and thus doesn't require the mesh to
+        be watertight.
+
+        Density is a mass-per-area value which is linearly interpolated
+        within each triangle. It can be specified either per-vertex
+        (shared between adjacent faces) or per-face (constant within
+        each face). If neither is passed a uniform density of 1.0 is
+        used.
+
+        Parameters
+        ----------
+        vertex_density : (n_vertices,) float or float
+          Non-negative area density at each vertex.
+        face_density : (n_faces,) float or float
+          Non-negative area density constant within each face.
+        reference_point : None or (3,) float
+          Point about which the inertia tensor is calculated.
+          If None the tensor is calculated about the center of mass.
+
+        Returns
+        ----------
+        properties : SurfaceMassProperties
+          With keys:
+          'mass'        : Total mass of the surface
+          'center_mass' : Center of mass location, in global coordinate system
+          'inertia'     : Taken about the requested reference point and
+                          aligned with the global coordinate system
+        """
+        if vertex_density is not None and face_density is not None:
+            raise ValueError("Only one of vertex_density and face_density may be passed!")
+
+        if vertex_density is not None:
+            vertex_density = np.asanyarray(vertex_density, dtype=np.float64)
+            if vertex_density.ndim == 0:
+                vertex_density = np.full(len(self.vertices), vertex_density)
+            if vertex_density.shape != (len(self.vertices),):
+                raise ValueError(
+                    f"vertex_density must be (n_vertices,) got {vertex_density.shape} for {len(self.vertices)} vertices!"
+                )
+            # shared vertex values mapped to the corners of each face
+            density = vertex_density[self.faces]
+        else:
+            if face_density is None:
+                face_density = 1.0
+            face_density = np.asanyarray(face_density, dtype=np.float64)
+            if face_density.ndim == 0:
+                face_density = np.full(len(self.faces), face_density)
+            if face_density.shape != (len(self.faces),):
+                raise ValueError(
+                    f"face_density must be (n_faces,) got {face_density.shape} for {len(self.faces)} faces!"
+                )
+            # constant within each face
+            density = np.repeat(face_density, 3).reshape((-1, 3))
+
+        return triangles.surface_mass_properties(
+            triangles=self.triangles,
+            density=density,
+            reference_point=reference_point,
         )
 
     def invert(self) -> Self:

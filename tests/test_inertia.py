@@ -526,6 +526,208 @@ def test_mass_against_solidworks():
                 assert g.np.allclose(calc[key], truth[key], atol=1e-2)
 
 
+def test_surface_triangle_analytic():
+    # a single triangle with linearly interpolated density
+    # vertices (0,0) (1,0) (0,1) with density 1, 2, 3
+    # corresponds to density(x, y) = 1 + x + 2 * y
+    tri = g.trimesh.Trimesh(
+        vertices=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        faces=[[0, 1, 2]],
+    )
+    props = tri.surface_mass_properties(
+        vertex_density=[1.0, 2.0, 3.0], reference_point=[0.0, 0.0, 0.0]
+    )
+
+    # hand-integrated values for density = 1 + x + 2y over the triangle
+    assert g.np.isclose(props.mass, 1.0)
+    assert g.np.allclose(props.center_mass, [1.0 / 3.0, 3.0 / 8.0, 0.0])
+    truth = g.np.array(
+        [
+            [1.0 / 5.0, -11.0 / 120.0, 0.0],
+            [-11.0 / 120.0, 1.0 / 6.0, 0.0],
+            [0.0, 0.0, 11.0 / 30.0],
+        ]
+    )
+    assert g.np.allclose(props.inertia, truth)
+
+    # the same density expressed per-face should be identical
+    # as every corner of the single face is constant
+    const = tri.surface_mass_properties(face_density=[2.0])
+    assert g.np.isclose(const.mass, 1.0)
+    assert g.np.allclose(const.center_mass, [1.0 / 3.0, 1.0 / 3.0, 0.0])
+
+    # inertia about the center of mass follows the parallel axis theorem
+    at_com = tri.surface_mass_properties(vertex_density=[1.0, 2.0, 3.0])
+    offset = g.trimesh.inertia.transform_inertia(
+        transform=g.np.eye(4),
+        inertia_tensor=truth,
+        parallel_axis=True,
+        mass=props.mass,
+    )
+    # moving the frame by zero translation should do nothing
+    assert g.np.allclose(offset, truth)
+    # check parallel axis from origin tensor to center of mass
+    c = props.center_mass
+    pat = props.mass * (g.np.dot(c, c) * g.np.eye(3) - g.np.outer(c, c))
+    assert g.np.allclose(at_com.inertia, truth - pat)
+
+
+def test_surface_two_density_plate():
+    # a 2x1 plate in the z=0 plane split at x=1
+    # left half density 1, right half density 3
+    vertices = g.np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ]
+    )
+    faces = g.np.array([[0, 1, 4], [0, 4, 3], [1, 2, 5], [1, 5, 4]])
+    plate = g.trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    assert not plate.is_watertight
+
+    props = plate.surface_mass_properties(face_density=[1.0, 1.0, 3.0, 3.0])
+
+    # mass is the sum of area * density of the two halves
+    assert g.np.isclose(props.mass, 4.0)
+    assert g.np.allclose(props.center_mass, [1.25, 0.5, 0.0])
+
+    # inertia of the two unit squares about the combined center of mass
+    # each square: Ixx = Iyy = m / 12 about its own center
+    # plus the parallel axis offset of each half
+    ixx = 1.0 / 12.0 + 3.0 / 12.0
+    iyy = 1.0 / 12.0 + 1.0 * 0.75**2 + 3.0 / 12.0 + 3.0 * 0.25**2
+    truth = g.np.diag([ixx, iyy, ixx + iyy])
+    assert g.np.allclose(props.inertia, truth)
+
+    # a uniform vertex density must match a uniform face density
+    # and simple scalar input should broadcast
+    v = plate.surface_mass_properties(vertex_density=2.0)
+    f = plate.surface_mass_properties(face_density=2.0)
+    assert g.np.isclose(v.mass, f.mass)
+    assert g.np.allclose(v.center_mass, f.center_mass)
+    assert g.np.allclose(v.inertia, f.inertia)
+
+
+def test_surface_degenerate():
+    # degenerate triangles should contribute no mass
+    vertices = g.np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ]
+    )
+    faces = g.np.array([[0, 1, 2], [1, 3, 3]])
+    mesh = g.trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    props = mesh.surface_mass_properties(face_density=[1.0, 5.0])
+    # only the first face has area
+    assert g.np.isclose(props.mass, 0.5)
+    assert g.np.allclose(props.center_mass, [1.0 / 3.0, 1.0 / 3.0, 0.0])
+
+    # a mesh with no mass at all shouldn't raise
+    zero = mesh.surface_mass_properties(face_density=[0.0, 0.0])
+    assert g.np.isclose(zero.mass, 0.0)
+    assert g.np.isfinite(zero.center_mass).all()
+    assert g.np.isfinite(zero.inertia).all()
+
+
+def test_surface_validation():
+    mesh = g.trimesh.creation.box()
+
+    # negative densities are not physical
+    with g.pytest.raises(ValueError):
+        mesh.surface_mass_properties(face_density=-1.0)
+    with g.pytest.raises(ValueError):
+        mesh.surface_mass_properties(vertex_density=g.np.full(len(mesh.vertices), -1.0))
+
+    # lengths must match the mesh
+    with g.pytest.raises(ValueError):
+        mesh.surface_mass_properties(vertex_density=[1.0, 2.0])
+    with g.pytest.raises(ValueError):
+        mesh.surface_mass_properties(face_density=[1.0, 2.0])
+
+    # density input is ambiguous
+    with g.pytest.raises(ValueError):
+        mesh.surface_mass_properties(vertex_density=1.0, face_density=1.0)
+
+    # reference point must be a single 3D point
+    with g.pytest.raises(ValueError):
+        mesh.surface_mass_properties(reference_point=[1.0, 2.0])
+
+
+def test_surface_transforms():
+    # an open surface with two different densities
+    vertices = g.np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ]
+    )
+    faces = g.np.array([[0, 1, 4], [0, 4, 3], [1, 2, 5], [1, 5, 4]])
+    density = g.np.array([1.0, 1.0, 3.0, 3.0])
+    mesh = g.trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    p0 = mesh.surface_mass_properties(face_density=density)
+
+    # translation: mass and inertia about the center of mass are unchanged
+    t = g.np.eye(4)
+    t[:3, 3] = [3.0, -2.0, 5.0]
+    moved = mesh.copy()
+    moved.apply_transform(t)
+    p1 = moved.surface_mass_properties(face_density=density)
+    assert g.np.isclose(p0.mass, p1.mass)
+    assert g.np.allclose(p1.center_mass, p0.center_mass + t[:3, 3])
+    assert g.np.allclose(p0.inertia, p1.inertia)
+
+    # rotation: inertia rotates as a tensor
+    r = g.trimesh.transformations.rotation_matrix(0.8, [1.0, 2.0, 3.0])
+    rotated = mesh.copy()
+    rotated.apply_transform(r)
+    p2 = rotated.surface_mass_properties(face_density=density)
+    assert g.np.isclose(p0.mass, p2.mass)
+    assert g.np.allclose(p2.center_mass, g.np.dot(r[:3, :3], p0.center_mass))
+    check = g.trimesh.inertia.transform_inertia(transform=r, inertia_tensor=p0.inertia)
+    assert g.np.allclose(p2.inertia, check)
+
+    # uniform scaling: mass scales with area, inertia with area * length^2
+    s = 2.5
+    scaled = mesh.copy()
+    scaled.apply_scale(s)
+    p3 = scaled.surface_mass_properties(face_density=density)
+    assert g.np.isclose(p3.mass, p0.mass * s**2)
+    assert g.np.allclose(p3.center_mass, p0.center_mass * s)
+    assert g.np.allclose(p3.inertia, p0.inertia * s**4)
+
+    # inertia about an arbitrary reference point matches parallel axis
+    # from the center of mass tensor
+    ref = g.np.array([1.0, -4.0, 2.0])
+    at_ref = mesh.surface_mass_properties(face_density=density, reference_point=ref)
+    c = p0.center_mass - ref
+    pat = p0.mass * (g.np.dot(c, c) * g.np.eye(3) - g.np.outer(c, c))
+    assert g.np.allclose(at_ref.inertia, p0.inertia + pat)
+
+
+def test_surface_volume_api_unchanged():
+    # the volume based mass properties should not be affected
+    # by the existence of the surface based properties
+    mesh = g.trimesh.creation.box()
+    assert g.np.isclose(mesh.mass, mesh.volume)
+    assert g.np.isclose(mesh.mass_properties.mass, mesh.volume)
+    # surface properties are a separate calculation
+    surface = mesh.surface_mass_properties()
+    assert g.np.isclose(surface.mass, mesh.area)
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     test_mass_against_solidworks()
