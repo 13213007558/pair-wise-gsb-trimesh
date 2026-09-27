@@ -37,6 +37,7 @@ from . import (
     units,
     util,
     visual,
+    winding,
 )
 from .caching import Cache, DataStore, TrackedArray, cache_decorator
 from .constants import log, tol
@@ -3173,6 +3174,66 @@ class Trimesh(Geometry3D):
           Whether or not each point is inside the mesh
         """
         return self.ray.contains_points(points)
+
+    @cache_decorator
+    def _winding_tree(self) -> "winding.WindingTree":
+        """
+        A bounding volume hierarchy over the current triangles used
+        for approximate generalized winding number queries. Cached
+        against the geometry hash so modifying the mesh rebuilds it.
+
+        Returns
+        ---------
+        tree : trimesh.winding.WindingTree
+          Hierarchy for the current triangles.
+        """
+        return winding.WindingTree(self.triangles.view(np.ndarray))
+
+    def winding_number(
+        self,
+        points: ArrayLike,
+        method: str = "tree",
+        beta: float = 2.0,
+        boundary_tol: Floating = None,
+    ) -> "winding.WindingNumberResult":
+        """
+        Compute the generalized winding number of the mesh at query
+        points: the total signed solid angle of all oriented
+        triangles divided by 4*pi.
+
+        Unlike 'contains' this does not assume a closed watertight
+        solid and returns continuous values rather than booleans,
+        which is useful for scanned surfaces with holes. The mesh is
+        used exactly as stored: no holes are filled and no faces are
+        re-oriented, so reversing every face flips the sign of the
+        result.
+
+        Parameters
+        ------------
+        points : (n, 3) float
+          Points in cartesian space
+        method : 'tree' or 'exact'
+          'exact' sums the solid angle of every triangle directly,
+          'tree' uses a cached bounding volume hierarchy with a
+          dipole approximation which is faster for batched queries
+        beta : float
+          Error control for the 'tree' method: clusters farther than
+          'beta * cluster_radius' are approximated by their dipole,
+          larger values are more accurate and slower
+        boundary_tol : float or None
+          Distance below which points are flagged as being on a
+          face, edge, or vertex; if None a small multiple of the
+          mesh scale is used, pass 0 to disable
+
+        Returns
+        ---------
+        result : trimesh.winding.WindingNumberResult
+          Continuous 'winding' values and 'boundary' flags per point
+        """
+        tree = self._winding_tree if method == "tree" else None
+        return winding.winding_number(
+            self, points, method=method, beta=beta, boundary_tol=boundary_tol, tree=tree
+        )
 
     @cache_decorator
     def face_angles(self) -> NDArray[float64]:
