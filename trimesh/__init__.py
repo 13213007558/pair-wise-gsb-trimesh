@@ -41,6 +41,7 @@ from . import (
     triangles,
     units,
     util,
+    winding,
 )
 from .base import Trimesh
 
@@ -130,4 +131,5 @@ __all__ = [
     "units",
     "util",
     "voxel",
+    "winding",
 ]

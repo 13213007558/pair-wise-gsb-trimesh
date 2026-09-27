@@ -37,6 +37,7 @@ from . import (
     units,
     util,
     visual,
+    winding,
 )
 from .caching import Cache, DataStore, TrackedArray, cache_decorator
 from .constants import log, tol
@@ -3173,6 +3174,71 @@ class Trimesh(Geometry3D):
           Whether or not each point is inside the mesh
         """
         return self.ray.contains_points(points)
+
+    @cache_decorator
+    def winding_tree(self) -> winding.WindingTree:
+        """
+        A bounding volume hierarchy over the current triangles used
+        for hierarchical (approximate) generalized winding number
+        queries.
+
+        The tree is cached and is rebuilt automatically if the mesh
+        geometry is modified.
+
+        Returns
+        ---------
+        tree : trimesh.winding.WindingTree
+          Hierarchy over the current triangles.
+        """
+        return winding.WindingTree(self.triangles.view(np.ndarray))
+
+    def winding_numbers(
+        self,
+        points: ArrayLike,
+        method: str = "exact",
+        theta: float = 0.5,
+        boundary_tol: float | None = None,
+    ) -> winding.WindingResult:
+        """
+        Compute the generalized winding number of every query point:
+        the sum of the signed solid angles of every triangle as seen
+        from the point, divided by 4*pi.
+
+        Unlike 'contains' this does not assume the mesh is a closed
+        consistently oriented volume and returns continuous values
+        rather than booleans, which remain meaningful for meshes with
+        holes or self-intersections. The mesh is used exactly as
+        stored: no holes are filled and no faces are re-oriented, so
+        inverting every face flips the sign of the result.
+
+        Parameters
+        ------------
+        points : (n, 3) float
+          Points in cartesian space.
+        method : str
+          'exact' sums the solid angle of every triangle directly,
+          'approximate' uses a cached hierarchy with a dipole
+          approximation for distant triangle clusters.
+        theta : float
+          Opening angle controlling the error of the 'approximate'
+          method: smaller values are more accurate and slower.
+        boundary_tol : float or None
+          Distance below which a point is marked as being on the
+          boundary (face, edge, or vertex) where the winding number
+          is discontinuous or ill-defined.
+
+        Returns
+        ---------
+        result : trimesh.winding.WindingResult
+          Continuous winding numbers and boundary flags per point.
+        """
+        if method == "exact":
+            return winding.winding_numbers_exact(self, points, boundary_tol=boundary_tol)
+        elif method == "approximate":
+            return winding.winding_numbers_approximate(
+                self, points, theta=theta, boundary_tol=boundary_tol
+            )
+        raise ValueError("method must be 'exact' or 'approximate'")
 
     @cache_decorator
     def face_angles(self) -> NDArray[float64]:
