@@ -353,6 +353,114 @@ class VoxelGridTest(g.unittest.TestCase):
         self.assertLess(hollow.filled_count, filled.filled_count)
         self.assertGreater(hollow.filled_count, 0)
 
+    def test_surface(self):
+        """
+        Test the conservative triangle-box surface voxelization.
+        """
+        from trimesh.voxel import creation
+
+        # a slanted quad triangulated along either diagonal: neither
+        # triangulation may miss the underlying surface
+        vertices = g.np.array(
+            [[0, 0, 0], [1, 0, 0.3], [1, 1, 0.3], [0, 1, 0]], dtype=g.np.float64
+        )
+        grids = []
+        for faces in ([[0, 1, 2], [0, 2, 3]], [[0, 1, 3], [1, 2, 3]]):
+            mesh = g.trimesh.Trimesh(vertices, g.np.array(faces))
+            grids.append(creation.voxelize_surface(mesh, pitch=0.1))
+        # densely sample the original quad surface
+        u = g.np.linspace(0, 1, 50)
+        U, W = g.np.meshgrid(u, u)
+        samples = g.np.column_stack((U.ravel(), W.ravel(), 0.3 * U.ravel()))
+        for grid in grids:
+            assert grid.is_filled(samples).all()
+
+        # a very thin sliver triangle must not fall between samples
+        sliver = g.trimesh.Trimesh(
+            g.np.array([[0, 0, 0], [3, 0.01, 0.02], [3, 0, 0]], dtype=g.np.float64),
+            g.np.array([[0, 1, 2]]),
+        )
+        grid = creation.voxelize_surface(sliver, pitch=0.25)
+        t = g.np.linspace(0, 1, 200).reshape(-1, 1)
+        medial = t * g.np.array([[3.0, 0.005, 0.01]])
+        assert grid.is_filled(medial).all()
+
+        # a degenerate zero-area segment still marks the cells it crosses
+        segment = g.trimesh.Trimesh(
+            g.np.array([[0, 0, 0], [2.05, 0, 0], [2.05, 0, 0]], dtype=g.np.float64),
+            g.np.array([[0, 1, 2]]),
+        )
+        grid = creation.voxelize_surface(segment, pitch=0.5)
+        assert grid.sparse_indices.tolist() == [[i, 0, 0] for i in range(5)]
+
+        # boundary tangency counts as occupied: a triangle exactly on a
+        # shared voxel face plane marks the cells on both sides
+        tangent = g.trimesh.Trimesh(
+            g.np.array([[0, 0, 0.5], [1, 0, 0.5], [0, 1, 0.5]], dtype=g.np.float64),
+            g.np.array([[0, 1, 2]]),
+        )
+        grid = creation.voxelize_surface(tangent, pitch=1.0)
+        z_marked = set(grid.sparse_indices[:, 2].tolist())
+        assert z_marked == {0, 1}
+
+        # a triangle exactly on a shared voxel corner marks all 8 cells
+        corner = g.trimesh.Trimesh(
+            g.np.array(
+                [[0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]],
+                dtype=g.np.float64,
+            ),
+            g.np.array([[0, 1, 2]]),
+        )
+        grid = creation.voxelize_surface(corner, pitch=1.0)
+        assert grid.filled_count == 8
+
+        # only surface cells are produced: the interior of a closed
+        # box must stay empty
+        box = g.trimesh.creation.box(extents=[3, 3, 3])
+        grid = creation.voxelize_surface(box, pitch=1.0)
+        assert not grid.is_filled([[0, 0, 0]]).any()
+
+        # per-axis pitch and a caller-provided grid origin are carried
+        # into the transform and anchor the grid
+        pitch = g.np.array([0.1, 0.2, 0.05])
+        origin = g.np.array([0.01, 0.02, 0.03])
+        mesh = g.trimesh.Trimesh(vertices, g.np.array([[0, 1, 2], [0, 2, 3]]))
+        grid = creation.voxelize_surface(mesh, pitch=pitch, origin=origin)
+        assert g.np.allclose(grid.scale, pitch)
+        # shifting the origin by exactly one pitch must produce the
+        # same physical cells
+        shifted = creation.voxelize_surface(mesh, pitch=pitch, origin=origin + pitch)
+        assert g.np.allclose(
+            g.np.sort(grid.points, axis=0), g.np.sort(shifted.points, axis=0)
+        )
+
+        # tiny faces very far apart are handled by local candidate
+        # traversal without a dense array spanning the scene
+        far = g.trimesh.Trimesh(
+            g.np.array(
+                [
+                    [0, 0, 0],
+                    [0.1, 0, 0],
+                    [0, 0.1, 0],
+                    [1e6, 0, 0],
+                    [1e6 + 0.1, 0, 0],
+                    [1e6, 0.1, 0],
+                ],
+                dtype=g.np.float64,
+            ),
+            g.np.array([[0, 1, 2], [3, 4, 5]]),
+        )
+        grid = creation.voxelize_surface(far, pitch=0.05)
+        assert grid.filled_count > 0
+
+        # an empty mesh produces an empty grid rather than failing
+        empty = creation.voxelize_surface(g.trimesh.Trimesh(), pitch=0.5)
+        assert empty.filled_count == 0
+
+        # the method is registered for the dispatcher
+        grid = g.trimesh.creation.box().voxelized(pitch=0.2, method="surface")
+        assert grid.filled_count > 0
+
     def test_fill(self):
         from trimesh.voxel.morphology import fillers
 

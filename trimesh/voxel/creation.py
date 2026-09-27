@@ -65,6 +65,149 @@ def voxelize_subdivide(
     )
 
 
+def _occupied_cells(triangle, lower, upper):
+    """
+    Return the integer indices of every unit grid cell in the inclusive
+    index range lower..upper whose *closed* box is touched by a
+    triangle, evaluated with the separating axis theorem.
+
+    Cells are unit cubes centered on integer coordinates. Tangency
+    counts as overlap, so a triangle lying exactly on a shared cell
+    face, edge or corner marks all cells meeting there.
+
+    Parameters
+    ------------
+    triangle : (3, 3) float
+      Triangle vertices in grid coordinates.
+    lower : (3,) int
+      Lowest candidate cell index per axis.
+    upper : (3,) int
+      Highest candidate cell index per axis.
+
+    Returns
+    ------------
+    cells : (n, 3) int
+      Indices of the cells overlapped by the triangle.
+    """
+    grids = np.meshgrid(
+        *(np.arange(lower[k], upper[k] + 1) for k in range(3)), indexing="ij"
+    )
+    centers = np.column_stack([g.ravel() for g in grids])
+
+    # triangle vertices relative to each candidate cell center
+    relative = triangle[np.newaxis, :, :] - centers[:, np.newaxis, :].astype(np.float64)
+
+    edges = np.array(
+        [
+            triangle[1] - triangle[0],
+            triangle[2] - triangle[1],
+            triangle[0] - triangle[2],
+        ]
+    )
+    # separating axes: the 9 edge/box-axis cross products and the
+    # triangle normal; degenerate (zero) axes pass trivially
+    axes = [np.cross(edge, axis) for edge in edges for axis in np.eye(3)]
+    axes.append(np.cross(edges[0], edges[1]))
+
+    keep = np.ones(len(centers), dtype=bool)
+    for axis in axes:
+        # projection radius of the unit cell onto the axis
+        radius = 0.5 * np.abs(axis).sum()
+        projection = np.einsum("nij,j->ni", relative, axis)
+        # closed interval overlap: touching counts as occupied
+        keep &= (projection.min(axis=1) <= radius) & (projection.max(axis=1) >= -radius)
+
+    # the three box principal axes
+    keep &= np.all(relative.min(axis=1) <= 0.5, axis=1)
+    keep &= np.all(relative.max(axis=1) >= -0.5, axis=1)
+
+    return centers[keep]
+
+
+@log_time
+def voxelize_surface(
+    mesh, pitch: ArrayLike, origin: ArrayLike | None = None
+) -> base.VoxelGrid:
+    """
+    Conservatively voxelize the surface of a mesh by testing each
+    triangle against the voxel boxes it overlaps, rather than by
+    point sampling.
+
+    Every voxel whose closed cell is touched by any triangle is marked
+    occupied, so thin or sliver geometry cannot fall between samples
+    and the result does not depend on how the surface was triangulated.
+    Only surface voxels are produced: no interior filling is done.
+
+    Boundary tangency counts as occupied: cells are treated as closed
+    boxes, hence a triangle lying exactly on a shared voxel face, edge
+    or corner marks all cells sharing that boundary element.
+
+    Candidate cells are enumerated locally inside each triangle's own
+    bounding box, so widely separated small faces never require a
+    dense array spanning the whole scene.
+
+    Parameters
+    ------------
+    mesh : trimesh.Trimesh
+      Source geometry.
+    pitch : float or (3,) float
+      Side length of a voxel, either uniform or per-axis.
+    origin : None or (3,) float
+      Position of the center of cell (0, 0, 0) in model space,
+      anchoring the grid. If None the global origin (0, 0, 0) is
+      used, matching voxelize_subdivide.
+
+    Returns
+    ------------
+    grid : VoxelGrid
+      Surface voxels; the transform carries the per-axis pitch and
+      the translation implied by origin.
+    """
+    pitch = np.asarray(pitch, dtype=np.float64)
+    if pitch.ndim == 0:
+        pitch = np.full(3, float(pitch))
+    if pitch.shape != (3,) or np.any(pitch <= 0.0):
+        raise ValueError("pitch must be a positive float or (3,) float")
+
+    if origin is None:
+        origin = np.zeros(3)
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+
+    # work in grid coordinates where cell i spans [i - 0.5, i + 0.5]
+    triangles = (np.asarray(mesh.triangles, dtype=np.float64) - origin) / pitch
+
+    occupied = []
+    for triangle in triangles:
+        # closed boxes: a cell is a candidate whenever its box touches
+        # the triangle's own bounding box, tangency included
+        lower = np.ceil(triangle.min(axis=0) - 0.5).astype(np.int64)
+        upper = np.floor(triangle.max(axis=0) + 0.5).astype(np.int64)
+        if np.any(upper < lower):
+            continue
+        occupied.append(_occupied_cells(triangle, lower, upper))
+
+    if len(occupied) == 0:
+        indices = np.zeros((0, 3), dtype=np.int64)
+    else:
+        indices = np.vstack(occupied)
+        unique, _ = grouping.unique_rows(indices)
+        indices = indices[unique]
+
+    if len(indices) == 0:
+        origin_index = np.zeros(3, dtype=np.int64)
+        encoding = enc.SparseBinaryEncoding(indices, shape=(0, 0, 0))
+    else:
+        origin_index = indices.min(axis=0)
+        encoding = enc.SparseBinaryEncoding(indices - origin_index)
+
+    return base.VoxelGrid(
+        encoding,
+        transform=tr.scale_and_translate(
+            scale=pitch, translate=origin + origin_index * pitch
+        ),
+    )
+
+
 def local_voxelize(
     mesh,
     point: ArrayLike,
@@ -280,7 +423,10 @@ def voxelize_binvox(
 
 
 voxelizers = util.FunctionRegistry(
-    ray=voxelize_ray, subdivide=voxelize_subdivide, binvox=voxelize_binvox
+    ray=voxelize_ray,
+    subdivide=voxelize_subdivide,
+    binvox=voxelize_binvox,
+    surface=voxelize_surface,
 )
 
 
