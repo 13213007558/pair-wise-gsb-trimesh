@@ -2,7 +2,7 @@ import numpy as np
 
 from ... import graph, grouping, util
 from ...constants import tol_path
-from ...typed import ArrayLike, NDArray
+from ...typed import ArrayLike, Integer, NDArray
 from ..entities import Arc, Line
 
 
@@ -40,7 +40,11 @@ def dict_to_path(as_dict):
     return result
 
 
-def lines_to_path(lines: ArrayLike, index: NDArray[np.int64] | None = None) -> dict:
+def lines_to_path(
+    lines: ArrayLike,
+    index: NDArray[np.int64] | None = None,
+    digits: Integer | None = None,
+) -> dict:
     """
     Turn line segments into argument to be used for a Path2D or Path3D.
 
@@ -50,6 +54,9 @@ def lines_to_path(lines: ArrayLike, index: NDArray[np.int64] | None = None) -> d
       Line segments or connected polyline curve in 2D or 3D
     index : (n,) int64
       If passed save an index for each line segment.
+    digits : None or int
+      How many digits to consider when merging vertices,
+      defaults to tol_path.merge_digits.
 
     Returns
     -----------
@@ -60,6 +67,9 @@ def lines_to_path(lines: ArrayLike, index: NDArray[np.int64] | None = None) -> d
 
     if index is not None:
         index = np.asanyarray(index, dtype=np.int64)
+
+    if digits is None:
+        digits = tol_path.merge_digits
 
     if util.is_shape(lines, (-1, (2, 3))):
         # the case where we have a list of points
@@ -72,7 +82,7 @@ def lines_to_path(lines: ArrayLike, index: NDArray[np.int64] | None = None) -> d
         # convert lines to even number of (n, dimension) points
         lines = lines.reshape((-1, dimension))
         # merge duplicate vertices
-        unique, inverse = grouping.unique_rows(lines, digits=tol_path.merge_digits)
+        unique, inverse = grouping.unique_rows(lines, digits=digits)
         # use scipy edges_to_path to skip creating
         # a bajillion individual line entities which
         # will be super slow vs. fewer polyline entities

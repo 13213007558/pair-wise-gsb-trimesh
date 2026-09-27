@@ -156,6 +156,275 @@ class SectionTest(g.unittest.TestCase):
         assert all(set(m.metadata["face_index"] == idx) for m in multi)
 
 
+class CoplanarSectionTest(g.unittest.TestCase):
+    @staticmethod
+    def _plate(flip=False, subdivide=False):
+        """
+        A flat plate at z=0: an outer square of size 4 with a
+        centered square hole of size 1, triangulated in
+        different ways.
+        """
+        outer = [[-2, -2], [2, -2], [2, 2], [-2, 2]]
+        inner = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]
+        vertices = [p + [0.0] for p in outer + inner]
+        faces = []
+        for i in range(4):
+            o0, o1 = i, (i + 1) % 4
+            i0, i1 = 4 + i, 4 + (i + 1) % 4
+            if flip:
+                # same quad strip with the other diagonal
+                faces.append([o0, o1, i0])
+                faces.append([o1, i1, i0])
+            else:
+                faces.append([o0, o1, i1])
+                faces.append([o0, i1, i0])
+        if subdivide:
+            # replace the first quad with four triangles
+            # meeting at a new interior vertex
+            faces = faces[2:]
+            c = len(vertices)
+            vertices.append([-0.25, -1.25, 0.0])
+            faces.extend([[0, 1, c], [1, 5, c], [5, 4, c], [4, 0, c]])
+        return g.trimesh.Trimesh(
+            vertices=g.np.array(vertices, dtype=g.np.float64),
+            faces=g.np.array(faces),
+            process=False,
+        )
+
+    @staticmethod
+    def _signed_area(lines):
+        # twice the signed area of a loop in the XY plane
+        return (
+            lines[:, 0, 0] * lines[:, 1, 1] - lines[:, 1, 0] * lines[:, 0, 1]
+        ).sum()
+
+    def test_box_top(self):
+        # section plane exactly on the top face of a box
+        box = g.trimesh.creation.box()
+        normal = [0, 0, 1]
+        origin = [0, 0, 0.5]
+
+        # legacy behavior ignores coplanar faces entirely
+        assert box.section(plane_origin=origin, plane_normal=normal) is None
+        lines = g.trimesh.intersections.mesh_plane(
+            mesh=box, plane_normal=normal, plane_origin=origin
+        )
+        assert len(lines) == 0
+
+        # coplanar boundary handling returns the top square
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            mesh=box,
+            plane_normal=normal,
+            plane_origin=origin,
+            return_faces=True,
+            coplanar="boundary",
+        )
+        assert lines.shape == (4, 2, 3)
+        assert face_index.shape == (4,)
+        assert g.np.allclose(lines[:, :, 2], 0.5)
+
+        # face source must be one of the two top faces
+        top = set(g.np.nonzero(box.face_normals[:, 2] > 0.5)[0])
+        assert set(face_index).issubset(top)
+
+        # each segment must be a directed edge of its source face
+        vid = {tuple(v): i for i, v in enumerate(box.vertices)}
+        for seg, fi in zip(lines, face_index):
+            edge = (vid[tuple(seg[0])], vid[tuple(seg[1])])
+            f = box.faces[fi]
+            assert edge in {(f[0], f[1]), (f[1], f[2]), (f[2], f[0])}
+
+        # contour is oriented CCW seen from above like the
+        # winding of the coplanar top faces
+        assert self._signed_area(lines) > 0
+
+        # as a section: a single closed loop with unit area
+        section = box.section(
+            plane_origin=origin, plane_normal=normal, coplanar="boundary"
+        )
+        assert section is not None
+        assert section.is_closed
+        assert len(section.entities) == 1
+        planar, _to_3D = section.to_2D()
+        assert len(planar.polygons_full) == 1
+        assert g.np.isclose(planar.polygons_full[0].area, 1.0)
+
+    def test_plate_with_hole(self):
+        # the same plate with a hole triangulated three ways:
+        # contour geometry must be identical and triangulation
+        # diagonals must never show up in the result
+        meshes = [
+            self._plate(),
+            self._plate(flip=True),
+            self._plate(subdivide=True),
+        ]
+        contours = []
+        for mesh in meshes:
+            lines, face_index = g.trimesh.intersections.mesh_plane(
+                mesh=mesh,
+                plane_normal=[0, 0, 1],
+                plane_origin=[0, 0, 0],
+                return_faces=True,
+                coplanar="boundary",
+            )
+            # 4 outer + 4 inner boundary segments
+            assert lines.shape == (8, 2, 3)
+            assert face_index.shape == (8,)
+
+            # every segment endpoint is one of the 8 corners:
+            # no triangulation diagonal or interior vertex
+            corners = {tuple(p) for p in mesh.vertices[:8, :2]}
+            for seg in lines:
+                assert tuple(seg[0][:2]) in corners
+                assert tuple(seg[1][:2]) in corners
+
+            # normalize segments to compare contour geometry
+            contours.append(
+                sorted(tuple(sorted(map(tuple, seg[:, :2]))) for seg in lines)
+            )
+
+            # outer boundary follows face winding CCW and the
+            # hole contour CW
+            outer = lines[g.np.abs(lines[:, :, :2]).max(axis=(1, 2)) > 1.0]
+            inner = lines[g.np.abs(lines[:, :, :2]).max(axis=(1, 2)) < 1.0]
+            assert len(outer) == 4
+            assert len(inner) == 4
+            assert self._signed_area(outer) > 0
+            assert self._signed_area(inner) < 0
+
+            # as a section: outer boundary and hole contour
+            section = mesh.section(
+                plane_origin=[0, 0, 0], plane_normal=[0, 0, 1], coplanar="boundary"
+            )
+            assert section is not None
+            assert section.is_closed
+            planar, _to_3D = section.to_2D()
+            assert len(planar.polygons_full) == 1
+            polygon = planar.polygons_full[0]
+            assert g.np.isclose(polygon.area, 15.0)
+            assert len(polygon.interiors) == 1
+
+        # identical geometry regardless of triangulation
+        assert contours[0] == contours[1]
+        assert contours[0] == contours[2]
+
+    def test_plane_through_edge(self):
+        # two triangles sharing an edge lying on the plane
+        # with both remaining vertices above the plane
+        mesh = g.trimesh.Trimesh(
+            vertices=g.np.array(
+                [[0, 0, 0], [1, 0, 0], [0.5, 1, 1], [0.5, -1, 1]],
+                dtype=g.np.float64,
+            ),
+            faces=g.np.array([[0, 1, 2], [1, 0, 3]]),
+            process=False,
+        )
+        kwargs = {"plane_normal": [0, 0, 1], "plane_origin": [0, 0, 0]}
+
+        # legacy behavior returns the shared edge twice
+        lines = g.trimesh.intersections.mesh_plane(mesh=mesh, **kwargs)
+        assert len(lines) == 2
+
+        # coplanar boundary handling merges the duplicate
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            mesh=mesh, return_faces=True, coplanar="boundary", **kwargs
+        )
+        assert lines.shape == (1, 2, 3)
+        assert face_index.shape == (1,)
+        assert face_index[0] in {0, 1}
+        assert g.np.allclose(lines[0][:, 2], 0.0)
+        assert g.np.allclose(sorted(lines[0][:, 0]), [0.0, 1.0])
+
+    def test_two_nearby_layers(self):
+        # two thin layers separated by a small gap: the two
+        # independent contours must not be welded together
+        gap = 1e-3
+        layers = []
+        for x in [0.0, 1.0 + gap]:
+            box = g.trimesh.creation.box(extents=[1.0, 1.0, 0.1])
+            box.apply_translation([x, 0.0, 0.05])
+            layers.append(box)
+        mesh = g.trimesh.util.concatenate(layers)
+
+        # plane on the coplanar top faces of both layers
+        section = mesh.section(
+            plane_origin=[0, 0, 0.1], plane_normal=[0, 0, 1], coplanar="boundary"
+        )
+        assert section is not None
+        assert section.is_closed
+        assert len(section.entities) == 2
+
+        planar, _to_3D = section.to_2D()
+        polygons = planar.polygons_closed
+        assert len(polygons) == 2
+        assert all(g.np.isclose(p.area, 1.0) for p in polygons)
+        # the small gap between the layers is preserved
+        assert g.np.isclose(polygons[0].distance(polygons[1]), gap)
+
+    def test_open_and_branching(self):
+        # three triangles sharing one edge on the plane: the
+        # boundary of this coplanar region branches and the
+        # result must be reported as open paths rather than
+        # being stitched into a closed loop
+        mesh = g.trimesh.Trimesh(
+            vertices=g.np.array(
+                [[0, 0, 0], [2, 0, 0], [1, 1, 0], [1, -1, 0], [3, 1, 0]],
+                dtype=g.np.float64,
+            ),
+            faces=g.np.array([[0, 1, 2], [1, 0, 3], [0, 1, 4]]),
+            process=False,
+        )
+        kwargs = {"plane_normal": [0, 0, 1], "plane_origin": [0, 0, 0]}
+
+        # the edge shared by three faces is discarded leaving
+        # the six outer edges
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            mesh=mesh, return_faces=True, coplanar="boundary", **kwargs
+        )
+        assert lines.shape == (6, 2, 3)
+        assert face_index.shape == (6,)
+
+        section = mesh.section(coplanar="boundary", **kwargs)
+        assert section is not None
+        # the graph branches so the path is not closed and
+        # the dangling chain is reported as an open entity
+        # rather than being stitched into a closed loop
+        assert not section.is_closed
+        assert any(not e.closed for e in section.entities)
+        # no segment was dropped or duplicated
+        assert sum(len(e.points) - 1 for e in section.entities) == 6
+
+    def test_scale(self):
+        # the on-plane tolerance follows the model scale so
+        # coplanar detection works for tiny and huge models
+        for scale in [1e-9, 1e6]:
+            box = g.trimesh.creation.box()
+            box.apply_scale(scale)
+            section = box.section(
+                plane_origin=[0, 0, 0.5 * scale],
+                plane_normal=[0, 0, 1],
+                coplanar="boundary",
+            )
+            assert section is not None
+            assert section.is_closed
+            assert len(section.entities) == 1
+            planar, _to_3D = section.to_2D()
+            assert len(planar.polygons_full) == 1
+            assert g.np.isclose(
+                planar.polygons_full[0].area, scale**2, atol=0, rtol=1e-4
+            )
+
+    def test_invalid_option(self):
+        box = g.trimesh.creation.box()
+        with self.assertRaises(ValueError):
+            g.trimesh.intersections.mesh_plane(
+                mesh=box,
+                plane_normal=[0, 0, 1],
+                plane_origin=[0, 0, 0],
+                coplanar="banana",
+            )
+
+
 class PlaneLine(g.unittest.TestCase):
     def test_planes(self):
         count = 10

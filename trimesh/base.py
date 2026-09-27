@@ -2299,7 +2299,11 @@ class Trimesh(Geometry3D):
         self._visual = value
 
     def section(
-        self, plane_normal: ArrayLike, plane_origin: ArrayLike, **kwargs
+        self,
+        plane_normal: ArrayLike,
+        plane_origin: ArrayLike,
+        coplanar: str = "ignore",
+        **kwargs,
     ) -> Path3D | None:
         """
         Returns a 3D cross section of the current mesh and a plane
@@ -2311,6 +2315,12 @@ class Trimesh(Geometry3D):
           Normal vector of section plane.
         plane_origin : (3, ) float
           Point on the cross section plane.
+        coplanar : str
+          How to handle faces lying fully on the section plane:
+          "ignore" skips them while "boundary" also returns the
+          outer boundary and hole contours of coplanar regions.
+          Open or branching contours are returned as open
+          entities rather than being forced into closed loops.
 
         Returns
         ---------
@@ -2327,6 +2337,7 @@ class Trimesh(Geometry3D):
             plane_normal=plane_normal,
             plane_origin=plane_origin,
             return_faces=True,
+            coplanar=coplanar,
             **kwargs,
         )
 
@@ -2336,7 +2347,15 @@ class Trimesh(Geometry3D):
 
         # otherwise load the line segments into the keyword arguments
         # for a Path3D object.
-        path = lines_to_path(lines)
+        if coplanar == "boundary":
+            # merge vertices with a tolerance scaled to the model
+            # which is still far too small to weld distinct
+            # nearby contours together
+            path = lines_to_path(
+                lines, digits=util.decimal_to_digits(tol.merge * self.scale, min_digits=1)
+            )
+        else:
+            path = lines_to_path(lines)
 
         # add the face index info into metadata
         # path.metadata["face_index"] = face_index
