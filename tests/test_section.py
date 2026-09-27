@@ -176,6 +176,326 @@ class PlaneLine(g.unittest.TestCase):
         assert valid.all()
         assert (g.np.abs(i[:, 2] - z) < g.tol.merge).all()
 
+    @staticmethod
+    def _step_mesh():
+        # a 2x2x1 slab with a 1x1x1 block centered on top
+        # as a single watertight mesh
+        vertices = g.np.array(
+            [
+                [0, 0, 0],
+                [2, 0, 0],
+                [2, 2, 0],
+                [0, 2, 0],
+                [0, 0, 1],
+                [2, 0, 1],
+                [2, 2, 1],
+                [0, 2, 1],
+                [0.5, 0.5, 1],
+                [1.5, 0.5, 1],
+                [1.5, 1.5, 1],
+                [0.5, 1.5, 1],
+                [0.5, 0.5, 2],
+                [1.5, 0.5, 2],
+                [1.5, 1.5, 2],
+                [0.5, 1.5, 2],
+            ],
+            dtype=g.np.float64,
+        )
+        faces = g.np.array(
+            [
+                [0, 2, 1],
+                [0, 3, 2],
+                [0, 1, 5],
+                [0, 5, 4],
+                [1, 2, 6],
+                [1, 6, 5],
+                [2, 3, 7],
+                [2, 7, 6],
+                [3, 0, 4],
+                [3, 4, 7],
+                [4, 5, 9],
+                [4, 9, 8],
+                [5, 6, 10],
+                [5, 10, 9],
+                [6, 7, 11],
+                [6, 11, 10],
+                [7, 4, 8],
+                [7, 8, 11],
+                [8, 9, 13],
+                [8, 13, 12],
+                [9, 10, 14],
+                [9, 14, 13],
+                [10, 11, 15],
+                [10, 15, 14],
+                [11, 8, 12],
+                [11, 12, 15],
+                [12, 13, 14],
+                [12, 14, 15],
+            ]
+        )
+        return g.trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    @staticmethod
+    def _hole_plate():
+        # a 4x4 plate 0.5 thick with a centered 1x1 through hole
+        o, i, h = 2.0, 0.5, 0.5
+        vertices = g.np.array(
+            [
+                [-o, -o, 0],
+                [o, -o, 0],
+                [o, o, 0],
+                [-o, o, 0],
+                [-i, -i, 0],
+                [i, -i, 0],
+                [i, i, 0],
+                [-i, i, 0],
+                [-o, -o, h],
+                [o, -o, h],
+                [o, o, h],
+                [-o, o, h],
+                [-i, -i, h],
+                [i, -i, h],
+                [i, i, h],
+                [-i, i, h],
+            ],
+            dtype=g.np.float64,
+        )
+        faces = g.np.array(
+            [
+                # bottom annulus
+                [0, 5, 1],
+                [0, 4, 5],
+                [1, 6, 2],
+                [1, 5, 6],
+                [2, 7, 3],
+                [2, 6, 7],
+                [3, 4, 0],
+                [3, 7, 4],
+                # top annulus
+                [8, 9, 13],
+                [8, 13, 12],
+                [9, 10, 14],
+                [9, 14, 13],
+                [10, 11, 15],
+                [10, 15, 14],
+                [11, 8, 12],
+                [11, 12, 15],
+                # outer walls
+                [0, 1, 9],
+                [0, 9, 8],
+                [1, 2, 10],
+                [1, 10, 9],
+                [2, 3, 11],
+                [2, 11, 10],
+                [3, 0, 8],
+                [3, 8, 11],
+                # inner (hole) walls
+                [4, 13, 5],
+                [4, 12, 13],
+                [5, 14, 6],
+                [5, 13, 14],
+                [6, 15, 7],
+                [6, 14, 15],
+                [7, 12, 4],
+                [7, 15, 12],
+            ]
+        )
+        return g.trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    @staticmethod
+    def _canonical_segments(lines):
+        # an order-independent set of undirected segments
+        segments = g.np.sort(g.np.round(lines, 8), axis=1)
+        return g.np.unique(segments.reshape((-1, 6)), axis=0)
+
+    def test_coplanar_box_top(self):
+        # a plane exactly on the top face of a box
+        box = g.trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+        kwargs = {"plane_normal": [0, 0, 1], "plane_origin": [0, 0, 0.5]}
+
+        # the default behavior ignores coplanar faces entirely
+        assert box.section(**kwargs) is None
+
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            box, return_faces=True, coplanar="boundary", **kwargs
+        )
+        # the diagonal shared by the two top triangles is interior
+        # to the coplanar region and must not be returned
+        assert len(lines) == 4
+        # every segment keeps its original source face
+        assert (box.face_normals[face_index][:, 2] > 0.5).all()
+        # segments are directed consistently with the face winding
+        cross = lines[:, 0, 0] * lines[:, 1, 1] - lines[:, 1, 0] * lines[:, 0, 1]
+        assert g.np.isclose(cross.sum(), 2.0)
+
+        section = box.section(coplanar="boundary", **kwargs)
+        # a single closed loop is reported as closed
+        assert len(section.entities) == 1
+        assert section.entities[0].closed
+        assert section.is_closed
+        # the source face of every segment is recorded
+        assert len(section.metadata["face_index"]) == 4
+        planar, _to_3D = section.to_planar()
+        assert g.np.isclose(planar.polygons_full[0].area, 1.0)
+
+    def test_coplanar_step(self):
+        # a section plane coincident with the slab top of a step
+        # shape: the block footprint is a hole in the coplanar region
+        mesh = self._step_mesh()
+        assert mesh.is_watertight
+        kwargs = {"plane_normal": [0, 0, 1], "plane_origin": [0, 0, 1.0]}
+
+        # without the option only the block sides contribute
+        # their on-plane edges
+        lines, _face_index = g.trimesh.intersections.mesh_plane(
+            mesh, return_faces=True, **kwargs
+        )
+        assert len(lines) == 4
+
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            mesh, return_faces=True, coplanar="boundary", **kwargs
+        )
+        # outer boundary plus hole contour: the segments from the
+        # block sides duplicate coplanar boundary edges and are merged
+        assert len(lines) == 8
+        # no geometric edge is returned twice
+        assert len(self._canonical_segments(lines)) == 8
+        # every segment comes from a coplanar top face
+        assert (mesh.face_normals[face_index][:, 2] > 0.5).all()
+
+        section = mesh.section(coplanar="boundary", **kwargs)
+        assert len(section.entities) == 2
+        assert all(e.closed for e in section.entities)
+        planar, _to_3D = section.to_planar()
+        assert len(planar.polygons_full) == 1
+        polygon = planar.polygons_full[0]
+        # the block footprint shows up as a hole in the region
+        assert len(polygon.interiors) == 1
+        assert g.np.isclose(polygon.area, 3.0)
+
+    def test_coplanar_hole_plate(self):
+        # a plane on the surface of a plate with a through hole
+        mesh = self._hole_plate()
+        assert mesh.is_watertight
+        kwargs = {"plane_normal": [0, 0, 1], "plane_origin": [0, 0, 0.5]}
+
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            mesh, return_faces=True, coplanar="boundary", **kwargs
+        )
+        # outer boundary and hole contour, no triangulation edges
+        assert len(lines) == 8
+        assert (mesh.face_normals[face_index][:, 2] > 0.5).all()
+
+        # the hole contour is wound opposite to the outer boundary
+        outer = g.np.abs(lines).max(axis=(1, 2)) > 1.0
+        cross = lines[:, 0, 0] * lines[:, 1, 1] - lines[:, 1, 0] * lines[:, 0, 1]
+        assert g.np.isclose(cross[outer].sum(), 32.0)
+        assert g.np.isclose(cross[~outer].sum(), -2.0)
+
+        section = mesh.section(coplanar="boundary", **kwargs)
+        assert len(section.entities) == 2
+        assert all(e.closed for e in section.entities)
+        planar, _to_3D = section.to_planar()
+        assert len(planar.polygons_full) == 1
+        polygon = planar.polygons_full[0]
+        assert len(polygon.interiors) == 1
+        assert g.np.isclose(polygon.area, 15.0)
+
+    def test_coplanar_through_edge(self):
+        # a plane passing exactly through two edges of a mesh
+        box = g.trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+        # contains the vertical edges at (0.5, 0.5) and (-0.5, -0.5)
+        kwargs = {
+            "plane_normal": g.trimesh.unitize([1.0, -1.0, 0.0]),
+            "plane_origin": [0.5, 0.5, 0.0],
+        }
+        # no face lies in the plane so both options agree
+        results = []
+        for coplanar in ("ignore", "boundary"):
+            lines, _face_index = g.trimesh.intersections.mesh_plane(
+                box, return_faces=True, coplanar=coplanar, **kwargs
+            )
+            results.append(self._canonical_segments(lines))
+            section = box.section(coplanar=coplanar, **kwargs)
+            # the diagonal cross section of the box is a rectangle
+            assert section.is_closed
+            planar, _to_3D = section.to_planar()
+            assert g.np.isclose(planar.polygons_full[0].area, g.np.sqrt(2.0))
+        assert (results[0] == results[1]).all()
+
+    def test_coplanar_nearby_sheets(self):
+        # two thin sheets separated by a small gap: a section on
+        # one sheet's surface must not weld the two contours
+        lower = g.trimesh.creation.box(extents=[1.0, 1.0, 0.1])
+        lower.apply_translation([0, 0, 0.05])
+        upper = lower.copy()
+        upper.apply_translation([0, 0, 0.101])
+        mesh = lower + upper
+
+        kwargs = {"plane_normal": [0, 0, 1], "plane_origin": [0, 0, 0.1]}
+        lines, face_index = g.trimesh.intersections.mesh_plane(
+            mesh, return_faces=True, coplanar="boundary", **kwargs
+        )
+        # only the lower sheet's top contour is returned
+        assert len(lines) == 4
+        assert g.np.allclose(lines[..., 2], 0.1)
+        assert (mesh.face_normals[face_index][:, 2] > 0.5).all()
+
+        section = mesh.section(coplanar="boundary", **kwargs)
+        assert len(section.entities) == 1
+        assert section.entities[0].closed
+
+    def test_coplanar_retriangulation(self):
+        # the same square plate with three different triangulations
+        corners = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]
+        meshes = [
+            g.trimesh.Trimesh(
+                vertices=corners, faces=[[0, 1, 2], [0, 2, 3]], process=False
+            ),
+            g.trimesh.Trimesh(
+                vertices=corners, faces=[[0, 1, 3], [1, 2, 3]], process=False
+            ),
+            g.trimesh.Trimesh(
+                vertices=corners + [[0.5, 0.5, 0]],
+                faces=[[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
+                process=False,
+            ),
+        ]
+        outlines = []
+        for mesh in meshes:
+            lines, _face_index = g.trimesh.intersections.mesh_plane(
+                mesh, [0, 0, 1], [0, 0, 0], return_faces=True, coplanar="boundary"
+            )
+            # interior edges and diagonals never show up
+            assert len(lines) == 4
+            outlines.append(self._canonical_segments(lines))
+        # the contour geometry is identical for every triangulation
+        assert (outlines[0] == outlines[1]).all()
+        assert (outlines[0] == outlines[2]).all()
+
+    def test_coplanar_open_path(self):
+        # an open surface sliced by a plane produces an open path
+        # which must be reported as such rather than being
+        # stitched into a closed loop
+        plate = g.trimesh.Trimesh(
+            vertices=[[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+            faces=[[0, 1, 2], [0, 2, 3]],
+            process=False,
+        )
+        section = plate.section(plane_normal=[1, 0, 0], plane_origin=[0.5, 0, 0])
+        assert section is not None
+        assert len(section.entities) == 1
+        assert not section.entities[0].closed
+        assert not section.is_closed
+
+    def test_coplanar_invalid(self):
+        # an unknown coplanar option is rejected
+        box = g.trimesh.creation.box()
+        with self.assertRaises(ValueError):
+            g.trimesh.intersections.mesh_plane(
+                box, [0, 0, 1], [0, 0, 0], coplanar="invalid"
+            )
+
 
 class SliceTest(g.unittest.TestCase):
     def test_slice(self):

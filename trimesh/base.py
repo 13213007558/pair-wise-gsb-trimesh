@@ -2311,18 +2311,28 @@ class Trimesh(Geometry3D):
           Normal vector of section plane.
         plane_origin : (3, ) float
           Point on the cross section plane.
+        coplanar : str
+          How to handle faces lying entirely in the section plane,
+          passed to trimesh.intersections.mesh_plane: 'ignore'
+          returns no segments for them while 'boundary' returns the
+          outer boundary and hole contours of coplanar regions.
 
         Returns
         ---------
         intersections
           Curve of intersection or None if it was not hit by plane.
+          Entities report whether they are closed loops through
+          entity.closed: open boundaries and branches are returned
+          as-is and are never stitched into a closed loop. The index
+          of the source face for every segment is stored in
+          metadata['face_index'].
         """
         # turn line segments into Path2D/Path3D objects
         from .path.exchange.misc import lines_to_path
         from .path.path import Path3D
 
         # return a single cross section in 3D
-        lines, _face_index = intersections.mesh_plane(
+        lines, face_index = intersections.mesh_plane(
             mesh=self,
             plane_normal=plane_normal,
             plane_origin=plane_origin,
@@ -2338,10 +2348,14 @@ class Trimesh(Geometry3D):
         # for a Path3D object.
         path = lines_to_path(lines)
 
-        # add the face index info into metadata
-        # path.metadata["face_index"] = face_index
+        # turn the segments into a Path3D
+        result = Path3D(**path)
 
-        return Path3D(**path)
+        # store the index of the mesh face each segment
+        # originated from in the metadata
+        result.metadata["face_index"] = face_index
+
+        return result
 
     def section_multiplane(
         self,

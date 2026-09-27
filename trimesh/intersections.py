@@ -21,6 +21,7 @@ def mesh_plane(
     return_faces=False,
     local_faces=None,
     cached_dots=None,
+    coplanar="ignore",
 ):
     """
     Find a the intersections between a mesh and a plane,
@@ -41,6 +42,16 @@ def mesh_plane(
     cached_dots : (n, 3) float
       If an external function has stored dot
       products pass them here to avoid recomputing.
+    coplanar : str
+      How to handle faces which lie entirely in the plane:
+        - 'ignore' : coplanar faces produce no segments.
+        - 'boundary' : return the directed boundary of coplanar
+          regions, i.e. the outer boundary and hole contours.
+          Edges shared by two coplanar faces (including
+          triangulation diagonals) are removed and segments
+          duplicated by non-coplanar faces are merged so every
+          geometric edge is returned exactly once with the
+          index and direction of its source face.
 
     Returns
     ----------
@@ -49,6 +60,13 @@ def mesh_plane(
     face_index : (m,) int
       Index of mesh.faces for each line
       Only returned if return_faces was True
+
+    Notes
+    ---------
+    The on-plane tolerance is scaled to the size of the mesh
+    (tol.merge * mesh.scale). Coplanar boundaries are matched
+    topologically by vertex index rather than by distance so
+    nearby but independent contours are never welded together.
     """
 
     def triangle_cases(signs):
@@ -156,6 +174,8 @@ def mesh_plane(
     plane_origin = np.asanyarray(plane_origin, dtype=np.float64)
     if plane_origin.shape != (3,) or plane_normal.shape != (3,):
         raise ValueError("Plane origin and normal must be (3,)!")
+    if coplanar not in ("ignore", "boundary"):
+        raise ValueError(f"invalid coplanar option: {coplanar!r}")
 
     if local_faces is None:
         # do a cross section against all faces
@@ -173,11 +193,16 @@ def mesh_plane(
         # shape is the same as mesh.faces (n,3)
         dots = np.dot(mesh.vertices - plane_origin, plane_normal)
 
+    # use a tolerance scaled to the size of the mesh so vertices
+    # very close to the plane are considered to be on it without
+    # merging features which are genuinely separate
+    merge_tol = tol.merge * mesh.scale
+
     # sign of the dot product is -1, 0, or 1
     # shape is the same as mesh.faces (n,3)
     signs = np.zeros(len(mesh.vertices), dtype=np.int8)
-    signs[dots < -tol.merge] = -1
-    signs[dots > tol.merge] = 1
+    signs[dots < -merge_tol] = -1
+    signs[dots > merge_tol] = 1
     signs = signs[faces]
 
     # figure out which triangles are in the cross section,
@@ -190,10 +215,49 @@ def mesh_plane(
     lines = np.vstack(
         [h(signs[c], faces[c], mesh.vertices) for c, h in zip(cases, handlers)]
     )
+    # the index into faces for each line segment
+    index = np.hstack([np.nonzero(c)[0] for c in cases])
+
+    if coplanar == "boundary":
+        # faces with all three vertices on the plane
+        on_plane = (signs == 0).all(axis=1)
+        if on_plane.any():
+            # directed edges of coplanar faces in winding order
+            edges, edge_face = geometry.faces_to_edges(faces[on_plane], return_index=True)
+            # edges referenced by exactly one coplanar face bound a
+            # coplanar region: edges shared by two coplanar faces are
+            # interior to the region (including triangulation
+            # diagonals) and are discarded
+            unique = grouping.group_rows(np.sort(edges, axis=1), require_count=1)
+            boundary = edges[unique]
+            # index into faces of the coplanar source face
+            boundary_faces = np.nonzero(on_plane)[0][edge_face[unique]]
+
+            if cases[2].any():
+                # one-edge segments sharing their edge with a coplanar
+                # face duplicate a coplanar boundary edge: drop them so
+                # every geometric edge is returned exactly once, matched
+                # topologically by vertex index rather than distance so
+                # nearby independent contours are never welded together
+                on_edge = faces[cases[2]]
+                on_edge = on_edge[signs[cases[2]] == 0].reshape((-1, 2))
+                width = len(mesh.vertices)
+                key = np.sort(on_edge, axis=1)
+                key = key[:, 0] * width + key[:, 1]
+                ref = np.sort(boundary, axis=1)
+                ref = ref[:, 0] * width + ref[:, 1]
+                drop = np.isin(key, ref)
+                if drop.any():
+                    keep = np.ones(len(lines), dtype=bool)
+                    start = cases[0].sum() + cases[1].sum()
+                    keep[start : start + len(drop)] = ~drop
+                    lines = lines[keep]
+                    index = index[keep]
+
+            lines = np.vstack((lines, mesh.vertices[boundary]))
+            index = np.hstack((index, boundary_faces))
 
     if return_faces:
-        # everything that hit something
-        index = np.hstack([np.nonzero(c)[0] for c in cases])
         assert index.dtype.kind == "i"
         if local_faces is None:
             return lines, index
