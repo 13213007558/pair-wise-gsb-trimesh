@@ -69,7 +69,7 @@ BooleanEngineType: TypeAlias = Literal["manifold", "blender"] | None
 BooleanOperationType: TypeAlias = Literal["difference", "union", "intersection"]
 
 # what are the supported methods for converting a mesh into voxels.
-VoxelizationMethodsType: TypeAlias = Literal["subdivide", "ray", "binvox"]
+VoxelizationMethodsType: TypeAlias = Literal["subdivide", "ray", "binvox", "surface"]
 
 
 @runtime_checkable

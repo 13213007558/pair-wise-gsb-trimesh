@@ -225,6 +225,126 @@ def voxelize_ray(
 
 
 @log_time
+def voxelize_surface(
+    mesh, pitch: Number | ArrayLike, origin: ArrayLike | None = None
+) -> base.VoxelGrid:
+    """
+    Voxelize a surface by testing each triangle against the voxel boxes
+    it overlaps using a triangle-vs-box intersection test.
+
+    This is a conservative surface voxelization intended for use cases
+    like collision broad-phase: every voxel whose closed box touches any
+    triangle is marked, including voxels only touched along a shared
+    face, edge, or corner. Tangency counts as occupied, so a triangle
+    lying exactly on a voxel boundary marks the voxels on both sides.
+    Only surface voxels are returned; no interior filling is performed.
+
+    Candidate voxels are visited locally around each triangle's bounding
+    box, so memory and runtime scale with the surface area rather than
+    the volume of the mesh's bounding box.
+
+    Parameters
+    -----------
+    mesh : trimesh.Trimesh
+      Source mesh
+    pitch : float or (3,) float
+      Side length of a voxel, uniform or per-axis.
+    origin : None or (3,) float
+      Position of the minimum corner of voxel (0, 0, 0): voxel index
+      `i` on axis `k` spans `origin[k] + [i, i + 1] * pitch[k]`.
+      Defaults to the world origin.
+
+    Returns
+    -----------
+    grid : VoxelGrid
+      Surface voxels aligned to the requested `origin` and `pitch`.
+    """
+    pitch = np.asarray(pitch, dtype=np.float64).reshape(-1)
+    if pitch.size == 1:
+        pitch = np.repeat(pitch, 3)
+    if pitch.shape != (3,) or not np.all(pitch > 0.0):
+        raise ValueError("pitch must be a positive float or (3,) float")
+
+    if origin is None:
+        origin = np.zeros(3)
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+
+    half = pitch / 2.0
+    hits = []
+    for tri in mesh.triangles.view(np.ndarray):
+        # tolerance scaled to the triangle and voxel size so exact
+        # tangency is reliably counted as occupied
+        tol = 1e-10 * (np.ptp(tri, axis=0).max() + half.max())
+
+        # candidate voxels are exactly those whose boxes overlap the
+        # triangle's own bounding box; expanding by the tolerance keeps
+        # boxes that only touch the triangle at a closed boundary
+        lo = np.floor((tri.min(axis=0) - origin - tol) / pitch).astype(np.int64)
+        hi = np.floor((tri.max(axis=0) - origin + tol) / pitch).astype(np.int64)
+        axes = [np.arange(lo[i], hi[i] + 1) for i in range(3)]
+        index = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        center = origin + (index + 0.5) * pitch
+
+        # triangle vertices relative to each candidate box center
+        v0 = tri[0] - center
+        v1 = tri[1] - center
+        v2 = tri[2] - center
+        # edges don't depend on the box center
+        e0 = tri[1] - tri[0]
+        e1 = tri[2] - tri[1]
+        e2 = tri[0] - tri[2]
+
+        # separating axis test for triangle vs box: the three box face
+        # axes are already covered by the candidate generation above,
+        # leaving the nine edge cross axes and the triangle plane
+        occupied = np.ones(len(index), dtype=bool)
+        for e in (e0, e1, e2):
+            for axis in (
+                (0.0, e[2], -e[1]),
+                (-e[2], 0.0, e[0]),
+                (e[1], -e[0], 0.0),
+            ):
+                a = np.asarray(axis)
+                radius = half.dot(np.abs(a)) + tol
+                proj = np.stack((v0.dot(a), v1.dot(a), v2.dot(a)))
+                occupied &= (proj.min(axis=0) <= radius) & (proj.max(axis=0) >= -radius)
+                if not occupied.any():
+                    break
+            if not occupied.any():
+                break
+
+        if occupied.any():
+            # the triangle plane must overlap the box; degenerate
+            # triangles have a zero normal and pass automatically
+            normal = np.cross(e0, e1)
+            radius = half.dot(np.abs(normal)) + tol
+            occupied &= np.abs(v0.dot(normal)) <= radius
+
+        if occupied.any():
+            hits.append(index[occupied])
+
+    if len(hits) == 0:
+        return base.VoxelGrid(
+            enc.SparseBinaryEncoding(np.zeros((0, 3), dtype=np.int64), shape=(0, 0, 0)),
+            transform=tr.scale_and_translate(scale=pitch, translate=origin + half),
+        )
+
+    occupied_index = np.concatenate(hits)
+    unique, _inverse = grouping.unique_rows(occupied_index)
+    occupied_index = occupied_index[unique]
+
+    # shift so the smallest occupied index is the encoding origin;
+    # the transform maps indices to voxel centers
+    origin_index = occupied_index.min(axis=0)
+    origin_position = origin + (origin_index + 0.5) * pitch
+
+    return base.VoxelGrid(
+        enc.SparseBinaryEncoding(occupied_index - origin_index),
+        transform=tr.scale_and_translate(scale=pitch, translate=origin_position),
+    )
+
+
+@log_time
 def voxelize_binvox(
     mesh,
     pitch: Number | None = None,
@@ -280,7 +400,10 @@ def voxelize_binvox(
 
 
 voxelizers = util.FunctionRegistry(
-    ray=voxelize_ray, subdivide=voxelize_subdivide, binvox=voxelize_binvox
+    ray=voxelize_ray,
+    subdivide=voxelize_subdivide,
+    binvox=voxelize_binvox,
+    surface=voxelize_surface,
 )
 
 

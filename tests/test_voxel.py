@@ -417,6 +417,124 @@ class VoxelGridTest(g.unittest.TestCase):
         assert hash_ori != hash(vg._data)
         assert g.np.allclose(vg.scale, scale)
 
+    def test_surface(self):
+        """
+        Test conservative surface voxelization via triangle-box overlap.
+        """
+        from trimesh.voxel import creation
+
+        def world_indices(grid, origin, pitch):
+            # recover occupied voxel indices in the caller's grid frame
+            origin_index = g.np.round(
+                (grid.translation - g.np.asarray(origin)) / g.np.asarray(pitch) - 0.5
+            ).astype(g.np.int64)
+            return grid.sparse_indices + origin_index
+
+        def assert_covered(grid, points, origin, pitch):
+            # every point on the source surface must fall in a marked voxel
+            expect = g.np.floor(
+                (g.np.asarray(points) - g.np.asarray(origin)) / g.np.asarray(pitch)
+            ).astype(g.np.int64)
+            marked = {tuple(i) for i in world_indices(grid, origin, pitch)}
+            missing = [tuple(i) for i in expect if tuple(i) not in marked]
+            assert not missing, f"voxels not marked: {missing}"
+
+        # a slanted planar quad, triangulated both ways: coverage of the
+        # original surface must not depend on the triangulation
+        quad = g.np.array(
+            [[0.1, 0.1, 0.0], [3.7, 0.4, 1.3], [4.0, 3.4, 3.2], [0.4, 3.1, 1.9]]
+        )
+        pitch = 0.5
+        origin = g.np.zeros(3)
+        grids = []
+        for faces in ([[0, 1, 2], [0, 2, 3]], [[0, 1, 3], [1, 2, 3]]):
+            mesh = g.trimesh.Trimesh(vertices=quad, faces=faces, process=False)
+            grid = creation.voxelize_surface(mesh, pitch=pitch, origin=origin)
+            # dense samples on the quad surface
+            samples = mesh.sample(500)
+            assert_covered(grid, samples, origin, pitch)
+            grids.append(grid)
+        # both triangulations should mark (nearly) the same voxels
+        a = {tuple(i) for i in world_indices(grids[0], origin, pitch)}
+        b = {tuple(i) for i in world_indices(grids[1], origin, pitch)}
+        assert a == b
+
+        # an extremely skinny triangle shouldn't lose voxels along its length
+        skinny = g.trimesh.Trimesh(
+            vertices=[[0.0, 0.0, 0.0], [10.0, 0.3, 0.1], [10.0, 0.3, 0.1001]],
+            faces=[[0, 1, 2]],
+            process=False,
+        )
+        grid = creation.voxelize_surface(skinny, pitch=0.25)
+        assert_covered(grid, skinny.sample(200), g.np.zeros(3), 0.25)
+
+        # a degenerate "triangle" that is really a line segment
+        segment = g.trimesh.Trimesh(
+            vertices=[[0.0, 0.0, 0.0], [2.0, 3.0, 4.0], [0.0, 0.0, 0.0]],
+            faces=[[0, 1, 2]],
+            process=False,
+        )
+        grid = creation.voxelize_surface(segment, pitch=0.5)
+        t = g.np.linspace(0, 1, 200).reshape(-1, 1)
+        assert_covered(grid, t * [2.0, 3.0, 4.0], g.np.zeros(3), 0.5)
+
+        # a triangle lying exactly on a shared voxel face is tangent to
+        # the voxels on both sides: tangency counts as occupied
+        tangent = g.trimesh.Trimesh(
+            vertices=[[0.2, 0.2, 1.0], [0.8, 0.2, 1.0], [0.5, 0.8, 1.0]],
+            faces=[[0, 1, 2]],
+            process=False,
+        )
+        grid = creation.voxelize_surface(tangent, pitch=1.0)
+        marked = {tuple(i) for i in world_indices(grid, g.np.zeros(3), 1.0)}
+        assert (0, 0, 0) in marked
+        assert (0, 0, 1) in marked
+        # nothing further away should be marked
+        assert all(i[2] in (0, 1) for i in marked)
+
+        # per-axis pitch and a caller-provided grid origin
+        origin = g.np.array([0.5, -1.0, 2.0])
+        pitch = g.np.array([1.0, 2.0, 0.25])
+        box = g.trimesh.creation.box(extents=[3.0, 5.0, 1.0])
+        box.apply_translation([0.5, -1.0, 2.0])
+        grid = creation.voxelize_surface(box, pitch=pitch, origin=origin)
+        assert g.np.allclose(grid.scale, pitch)
+        # every surface sample must be covered in the caller's frame
+        assert_covered(grid, box.sample(500), origin, pitch)
+        # voxel centers should sit on the requested grid
+        centers = grid.points
+        frac = (centers - origin) / pitch - 0.5
+        assert g.np.allclose(frac, g.np.round(frac))
+
+        # only surface voxels: a box interior must stay hollow
+        dense = grid.encoding.dense
+        inner = dense[1:-1, 1:-1, 1:-1]
+        assert inner.any()  # sanity: box is bigger than one voxel
+        # the exact center of the box is interior and must not be filled
+        center_index = g.np.floor((box.center_mass - origin) / pitch).astype(int)
+        center_index -= g.np.round((grid.translation - origin) / pitch - 0.5).astype(int)
+        assert not dense[tuple(center_index)]
+
+        # far-apart small faces must not allocate a dense bounding box:
+        # the encoding stays sparse and the filled count stays local
+        far = g.trimesh.Trimesh(
+            vertices=g.np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+                + [[1e4, 1e4, 1e4], [1e4 + 1, 1e4, 1e4], [1e4, 1e4 + 1, 1e4]]
+            ),
+            faces=[[0, 1, 2], [3, 4, 5]],
+            process=False,
+        )
+        grid = creation.voxelize_surface(far, pitch=0.5)
+        assert grid.filled_count < 100
+        # the conceptual dense shape spans the huge gap but is never
+        # materialized by the voxelizer
+        assert g.np.prod(grid.shape) > 1e9
+
+        # registered as a voxelize method
+        via_method = box.voxelized(pitch=0.5, method="surface")
+        assert via_method.filled_count > 0
+
 
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
